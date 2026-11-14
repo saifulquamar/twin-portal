@@ -1,16 +1,17 @@
-FROM python:3.11-slim
+FROM node:22-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+WORKDIR /workspace
 
-WORKDIR /app
+COPY package.json package-lock.json ./
+COPY server/package.json ./server/package.json
+COPY patient-portal/package.json ./patient-portal/package.json
 
-# Copy portal web application files and server
-COPY Mutanex_MyTwin/portal/ ./portal/
-COPY Mutanex_MyTwin/server.py ./server.py
+RUN npm ci --omit=dev
 
-# Cloud Run automatically sets the PORT environment variable (default 8080)
-ENV PORT=8080
-EXPOSE 8080
+COPY . .
 
-CMD ["python", "server.py"]
+ENV NODE_ENV=production
+ENV PORT=3000
+EXPOSE 3000
+
+CMD ["node", "server/bundle.mjs"]

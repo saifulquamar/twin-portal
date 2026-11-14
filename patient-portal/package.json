@@ -1,0 +1,22 @@
+{
+  "name": "mutanex-patient-portal",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "build": "tsc --noEmit && node build.mjs"
+  },
+  "dependencies": {
+    "d3": "^7.9.0",
+    "three": "^0.172.0"
+  },
+  "devDependencies": {
+    "@types/d3": "^7.4.3",
+    "@types/react": "^19.0.10",
+    "@types/three": "^0.172.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.2"
+  }
+}

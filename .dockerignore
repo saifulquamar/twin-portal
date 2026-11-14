@@ -12,3 +12,5 @@ Mutanex_MyTwin/*.bat
 Mutanex_MyTwin/*.command
 Mutanex_MyTwin/START_HERE.txt
 Mutanex_MyTwin/NOTICE.txt
+node_modules
+.playwright-cli

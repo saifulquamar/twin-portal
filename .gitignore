@@ -24,5 +24,6 @@ desktop.ini
 *.log
 scratch/
 
-# Reference source (not part of this repo)
+# Reference source & test captures
 MyTwin_Portal_Source/
+.playwright-cli/

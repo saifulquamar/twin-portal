@@ -4,13 +4,19 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "server"
+    "server",
+    "patient-portal"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace=server",
-    "build": "npm run build --workspace=server",
-    "start": "npm run start --workspace=server",
-    "lint": "npm run lint --workspace=server",
+    "dev": "node patient-portal/build.mjs && tsx watch server/src/index.ts",
+    "build": "tsc -p patient-portal/tsconfig.json --noEmit && node patient-portal/build.mjs && tsc -p server/tsconfig.json && node server/build.mjs",
+    "start": "node server.ts",
+    "lint": "tsc -p patient-portal/tsconfig.json --noEmit && tsc -p server/tsconfig.json --noEmit",
     "test": "npm test --workspace=server"
+  },
+  "dependencies": {
+    "@google/genai": "^3.3.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
   }
 }
