@@ -295,7 +295,7 @@ class TwinPortalHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         # Health check endpoint for the frontend Ask AI and Cloud Run
-        if self.path == "/v1/health" or self.path == "/health":
+        if self.path in ("/v1/health", "/health", "/v1/ask/health"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
