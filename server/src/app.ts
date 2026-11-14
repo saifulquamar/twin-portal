@@ -1,13 +1,35 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response, type Express } from 'express';
 import cors from 'cors';
 import { DefaultGeminiService, type GeminiService } from './gemini.js';
 import type { AskRequestBody, ExtractRequestBody } from './types.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function resolvePortalDir(): string | null {
+  const candidates = [
+    path.resolve(process.cwd(), 'Mutanex_MyTwin', 'portal'),
+    path.resolve(process.cwd(), '..', 'Mutanex_MyTwin', 'portal'),
+    path.resolve(__dirname, '..', '..', 'Mutanex_MyTwin', 'portal'),
+    path.resolve(__dirname, '..', '..', '..', 'Mutanex_MyTwin', 'portal'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return candidate;
+    }
+  }
+  return null;
+}
 
 export function createApp(geminiService: GeminiService = new DefaultGeminiService()): Express {
   const app = express();
 
   // Allowed CORS origins: local dev and deployed portal origin
   const allowedOrigins = [
+    'http://localhost:3000',
     'http://localhost:5180',
     'http://localhost:5181',
     'http://localhost:8080',
@@ -33,10 +55,13 @@ export function createApp(geminiService: GeminiService = new DefaultGeminiServic
   // Large limit for multimodal file base64 uploads in /v1/extract
   app.use(express.json({ limit: '50mb' }));
 
-  // Health check endpoint
-  app.get('/v1/ask/health', (_req: Request, res: Response) => {
+  // Health check endpoints
+  const healthHandler = (_req: Request, res: Response) => {
     res.status(200).json({ ok: true });
-  });
+  };
+  app.get('/v1/ask/health', healthHandler);
+  app.get('/v1/health', healthHandler);
+  app.get('/health', healthHandler);
 
   // Ask your twin endpoint
   app.post('/v1/ask', async (req: Request<{}, {}, AskRequestBody>, res: Response) => {
@@ -98,6 +123,28 @@ export function createApp(geminiService: GeminiService = new DefaultGeminiServic
       });
     }
   });
+
+  // Serve portal static frontend after API routes
+  const portalDir = resolvePortalDir();
+  if (portalDir) {
+    app.use(
+      express.static(portalDir, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('.webmanifest')) {
+            res.setHeader('Content-Type', 'application/manifest+json');
+          }
+        },
+      })
+    );
+
+    app.get('*', (req: Request, res: Response, next) => {
+      if (req.path.startsWith('/v1/') || path.extname(req.path)) {
+        next();
+        return;
+      }
+      res.sendFile(path.join(portalDir, 'index.html'));
+    });
+  }
 
   return app;
 }

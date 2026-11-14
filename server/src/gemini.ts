@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from '@google/genai';
-import type { AskRequestBody, AskResponse, ExtractRequestBody, ExtractResponse } from './types.js';
+import type { AskRequestBody, AskResponse, ExtractRequestBody, ExtractResponse, SourceItem } from './types.js';
 
 export interface GeminiService {
   ask(params: AskRequestBody): Promise<AskResponse>;
@@ -7,16 +7,105 @@ export interface GeminiService {
 }
 
 export class DefaultGeminiService implements GeminiService {
-  private ai: GoogleGenAI;
+  private ai: GoogleGenAI | null;
   private model: string;
 
-  constructor(apiKey = process.env.GEMINI_API_KEY || '', model = process.env.GEMINI_MODEL || 'gemini-2.0-flash') {
-    this.ai = new GoogleGenAI({ apiKey });
+  constructor(apiKey = process.env.GEMINI_API_KEY || '', model = process.env.GEMINI_MODEL || 'gemini-4-hydrogen') {
+    const trimmedKey = apiKey.trim();
+    this.ai = trimmedKey ? new GoogleGenAI({ apiKey: trimmedKey }) : null;
     this.model = model;
   }
 
+  private generateLocalKgAnswer(params: AskRequestBody): AskResponse {
+    const qLower = params.question.toLowerCase();
+    const words = qLower.split(/\s+/).filter((w) => w.length > 3);
+    const bundle = params.bundle || {};
+    const patient = bundle.patient || {};
+    const name = patient.preferred_name || 'the patient';
+    const insights: any[] = Array.isArray(bundle.insights) ? bundle.insights : [];
+    const labs: Record<string, any[]> = bundle.labs && typeof bundle.labs === 'object' ? bundle.labs : {};
+
+    const matchedInsights = insights.filter((ins) => {
+      const title = String(ins?.title || '').toLowerCase();
+      const found = String(ins?.found || '').toLowerCase();
+      const id = String(ins?.id || '').toLowerCase();
+      return words.some((w) => title.includes(w) || found.includes(w) || id.includes(w));
+    });
+
+    const matchedLabs: Array<[string, any]> = [];
+    for (const [labName, values] of Object.entries(labs)) {
+      if (
+        Array.isArray(values) &&
+        values.length > 0 &&
+        (qLower.includes(labName.toLowerCase()) || words.some((w) => labName.toLowerCase().includes(w)))
+      ) {
+        matchedLabs.push([labName, values[values.length - 1]]);
+      }
+    }
+
+    const answerParts: string[] = [];
+    const sources: SourceItem[] = [];
+
+    if (matchedInsights.length > 0) {
+      const top = matchedInsights[0];
+      answerParts.push(`Based on ${name}'s verified Knowledge Graph: ${top.found || top.title}`);
+      if (top.why) answerParts.push(`\n${top.why}`);
+      if (top.do) answerParts.push(`\nRecommended action: ${top.do}`);
+
+      for (const ins of matchedInsights.slice(0, 3)) {
+        sources.push({
+          kind: 'finding',
+          title: String(ins.title || '').slice(0, 45),
+          detail: String(ins.found || '').slice(0, 100),
+          finding_id: ins.id,
+        });
+      }
+    } else if (matchedLabs.length > 0) {
+      const labStrs = matchedLabs.map(
+        ([labName, val]) => `${labName}: ${val?.value} ${val?.unit || ''} (${val?.date || 'unknown date'})`
+      );
+      answerParts.push(`According to ${name}'s latest test records: ${labStrs.join('; ')}.`);
+      for (const [labName, val] of matchedLabs) {
+        sources.push({
+          kind: 'record',
+          title: `${labName} Result`,
+          detail: `${val?.value} ${val?.unit || ''} on ${val?.date || 'unknown date'}`,
+        });
+      }
+    } else {
+      const meds = Array.isArray(patient.medicines) && patient.medicines.length > 0
+        ? patient.medicines.join(', ')
+        : 'None recorded';
+      const conds = Array.isArray(patient.conditions) && patient.conditions.length > 0
+        ? patient.conditions.join(', ')
+        : 'None recorded';
+      answerParts.push(
+        `Here is what is currently mapped in ${name}'s Digital Twin Knowledge Graph:\n` +
+          `• Conditions: ${conds}\n` +
+          `• Current Medications: ${meds}\n` +
+          `Your twin evaluates interactions, lab trends, and organ status. Ask about a specific lab, medicine, or insight in your record for details.`
+      );
+      sources.push({
+        kind: 'record',
+        title: `${name}'s Medical Profile`,
+        detail: 'Active conditions and medications verified in twin',
+      });
+    }
+
+    if (params.mode === 'cdss') {
+      answerParts.push('\n\nFor physician review.');
+    }
+
+    return {
+      answer: answerParts.join(''),
+      sources,
+    };
+  }
+
   async ask(params: AskRequestBody): Promise<AskResponse> {
-    const isCdss = params.mode === 'cdss';
+    if (!this.ai) {
+      return this.generateLocalKgAnswer(params);
+    }
 
     const systemInstruction = `You are the Mutanex Digital Twin AI clinical assistant.
 Rules for your answer:
@@ -74,6 +163,10 @@ ${params.clinical ? `CLINICAL RESULTS:\n${JSON.stringify(params.clinical, null, 
   }
 
   async extract(params: ExtractRequestBody): Promise<ExtractResponse> {
+    if (!this.ai) {
+      throw new Error('GEMINI_API_KEY is not configured for multimodal lab report extraction');
+    }
+
     const systemInstruction = `You are a medical document analyzer. Extract all laboratory test results printed on this report.
 Rules:
 - Return only values printed on the report; never fill gaps, extrapolate, or guess.
