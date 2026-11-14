@@ -1,0 +1,46 @@
+Mutanex - My Twin (patient portal)
+==================================
+
+Ten patients are fictional and synthetic. Two, "Patient A" and "Patient B",
+are real patients shown de-identified: no names, no locations, dates
+shifted, birth year only. Switch patients with the name button at the top.
+
+Open it
+-------
+Windows : double-click  start.bat
+Mac     : double-click  start.command   (first time: right-click > Open)
+Then visit http://localhost:8080 in Chrome, Edge or Safari.
+
+(The portal must be served by a local web server; opening index.html
+directly from the file system will not load the 3D twin. Both start
+scripts need Python 3, which macOS and most Windows machines have.
+Without Python:  npx serve -l 8080 portal )
+
+Host it instead
+---------------
+Drag the "portal" folder onto https://app.netlify.com/drop (or any static
+host). It uses relative paths, so it also works in a sub-folder.
+
+Where to look
+-------------
+Twin     - tap any organ: solid = assessed now, ghosted = unlocked by tests
+Research - findings, each with its evidence grade and source
+Panel    - the personalised test panel and what each test unlocks
+Results  - (patients whose testing is done, e.g. Anika and Vikram) every
+           measured value, the action plan, recommendations and the refresh
+You      - profile, journey, check-in, reports
+
+Doctor view
+-----------
+Turn on "Doctor view" (sidebar on a computer; on a phone, tap the patient
+name at the top). A Clinical tab appears with each patient's full research
+results: personalised treatment options and their evidence, medicines and
+genes, drug interactions, drug discovery targets and compounds, longevity
+profile, the record, next steps, references and physician review items.
+Tap any row for its full detail.
+
+
+Legal
+-----
+See NOTICE.txt (ownership and permitted use) and
+portal/THIRD_PARTY_NOTICES.txt (open-source licences).

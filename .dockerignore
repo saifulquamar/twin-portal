@@ -1,0 +1,14 @@
+.git
+.gitignore
+*.log
+__pycache__
+*.pyc
+*.bak
+**/*.bak
+scratch/
+.vscode/
+.idea/
+Mutanex_MyTwin/*.bat
+Mutanex_MyTwin/*.command
+Mutanex_MyTwin/START_HERE.txt
+Mutanex_MyTwin/NOTICE.txt

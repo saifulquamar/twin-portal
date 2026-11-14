@@ -1,0 +1,12 @@
+Mutanex My Twin
+(c) 2026 Mutanex. All rights reserved.
+
+This copy is provided for viewing only. The software, design, twin model,
+content and data in it are proprietary and confidential to Mutanex.
+No copying, modification, reverse engineering, redistribution or reuse of
+any part, in whole or in part, without written permission from Mutanex.
+
+Open-source components are used under their own licences; see
+portal/THIRD_PARTY_NOTICES.txt.
+
+Nothing in this portal is a diagnosis or a prescription.
