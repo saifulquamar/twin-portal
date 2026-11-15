@@ -212,12 +212,36 @@ async function main() {
     'PatientSwitcherModal (zi)'
   );
 
-  // 8. Replace Preserve yourself (gi) with 3-Step Digital Identity Preservation Studio + 3D Twin + Voice Engine
+  // 8. Expose SDF human body generator & replace Preserve yourself (gi) with twin4 layout
+  const bodyFnAnchor = 'function vg(e=.011){return gg&&gg.h===e||(gg={h:e,geo:_g(hg(e))}),gg.geo}';
+  patched = replaceUniqueSubstring(
+    patched,
+    bodyFnAnchor,
+    `${bodyFnAnchor}globalThis.__MX_GET_BODY_RAW__=hg;`,
+    'Expose SDF body generator (hg)'
+  );
+
   patched = replaceWholeFunction(
     patched,
     'function gi({b:e}){',
     'function gi({b:e}){return(0,S.jsx)(globalThis.__MX_PORTAL__.PreserveScreen,{b:e,host:{getPatientId:D,readStore:R,writeStore:z,formatDate:M,Hero:_e,Icon:J,apiBase:oi,PatientTwin3D:Og}})}',
     'PreserveScreen (gi)'
+  );
+
+  const jgPreserveWrapAnchor = 'return t===`checkin`||t?.startsWith(`checkin`)?(0,S.jsx)(ra,';
+  patched = replaceUniqueSubstring(
+    patched,
+    jgPreserveWrapAnchor,
+    'return t===`preserve`?i:t===`checkin`||t?.startsWith(`checkin`)?(0,S.jsx)(ra,',
+    'Direct twin4 layout for PreserveScreen in Jg'
+  );
+
+  // 8b. Replace #/twin bottom text chat bar (f_) with Voice-Only FloatingVoiceLauncher
+  patched = replaceWholeFunction(
+    patched,
+    'function f_({b:e,go:t,show:n,doctor:r}){',
+    'function f_({b:e,go:t,show:n,doctor:r}){return(0,S.jsx)(globalThis.__MX_PORTAL__.FloatingVoiceLauncher,{b:e,go:t,show:n,doctor:r,Sheet:$r,AskComp:di})}',
+    'FloatingVoiceLauncher (f_)'
   );
 
   // 9. Replace Feed your twin (ma) with 8-Category Multimodal Feed System + AI Interpreter
@@ -236,12 +260,12 @@ async function main() {
     'ResearchScreen (Za)'
   );
 
-  // 11. Upgrade You screen (Jg): Preserve subtitle, compact Digital Identity Badge, and working Account/Auth footer
+  // 11. Upgrade You screen (Jg): Preserve subtitle, compact Digital Identity Badge, remove "See the onboarding again", and mount Account/Auth footer
   const preserveMenuAnchor = '[`preserve`,`Preserve yourself`,`Join the waitlist`,`preserve`]';
   patched = replaceUniqueSubstring(
     patched,
     preserveMenuAnchor,
-    '[`preserve`,`Preserve yourself`,`3D likeness, personal voice & memory vault`,`preserve`]',
+    '[`preserve`,`Preserve yourself`,`3D likeness, personal voice & memory`,`preserve`]',
     'Preserve menu subtitle (qg)'
   );
 
@@ -254,13 +278,39 @@ async function main() {
     'YouIdentityBadge (Jg)'
   );
 
-  const youLogoutAnchor =
-    '(0,S.jsx)(`button`,{className:`logout`,disabled:!0,title:`Sign-in arrives with your Mutanex account`,children:`Log out`}),(0,S.jsx)(`p`,{className:`note center`,children:`Sign-in, and so log out, arrive with your Mutanex account. Today your twin runs privately on this device.`})';
+  const youFooterButtonsAnchor =
+    ',(0,S.jsx)(`button`,{className:`secondary`,onClick:()=>n(`welcome`),children:`See the onboarding again`}),(0,S.jsx)(`button`,{className:`logout`,disabled:!0,title:`Sign-in arrives with your Mutanex account`,children:`Log out`}),(0,S.jsx)(`p`,{className:`note center`,children:`Sign-in, and so log out, arrive with your Mutanex account. Today your twin runs privately on this device.`})';
   patched = replaceUniqueSubstring(
     patched,
-    youLogoutAnchor,
-    '(0,S.jsx)(globalThis.__MX_PORTAL__.YouAccountFooter,{b:e,go:n})',
-    'YouAccountFooter (Jg)'
+    youFooterButtonsAnchor,
+    ',(0,S.jsx)(globalThis.__MX_PORTAL__.YouAccountFooter,{b:e,go:n})',
+    'Remove See onboarding again + mount YouAccountFooter (Jg)'
+  );
+
+  // 11b. Clean production copy in Settings & Privacy
+  patched = replaceUniqueSubstring(
+    patched,
+    'children:`Arrive with your account`',
+    'children:`Encrypted`',
+    'Settings security badge copy'
+  );
+  patched = replaceUniqueSubstring(
+    patched,
+    'Requests are recorded and completed within 30 days once accounts exist.',
+    'Requests are recorded and completed within 30 days.',
+    'Settings delete request copy'
+  );
+  patched = replaceUniqueSubstring(
+    patched,
+    'Care-team access is logged once accounts exist.',
+    'Care-team access is logged automatically.',
+    'Privacy access log copy'
+  );
+  patched = replaceUniqueSubstring(
+    patched,
+    'Only for the waitlist. Optional.',
+    'Optional.',
+    'Privacy preserve consent copy'
   );
 
   // 12. Ensure #/ask/ask routes straight to the Ask tab (checkin:ask) instead of Today check-in

@@ -10,7 +10,6 @@ import {
 import {
   buildSelfPerspectivePrompts,
   computePreservationScore,
-  createSampleVoiceWavBase64,
   type FaceLikenessData,
   type VoicePersonaData,
 } from './preserve-math';
@@ -41,6 +40,8 @@ const SOURCE_LABELS: Record<string, string> = {
   kg: 'Medical evidence',
   record: 'Your record',
   finding: 'Finding for you',
+  memory: 'Memory vault',
+  feed: 'Feed update',
 };
 
 function extractDomain(url?: string): string {
@@ -52,7 +53,7 @@ function extractDomain(url?: string): string {
   }
 }
 
-interface ChatTurn {
+interface SpokenTurn {
   me: string;
   a: string;
   links: string[];
@@ -159,13 +160,11 @@ export function AskPanel({
   host: PortalHostBridge;
 }) {
   const { navigate } = usePortalNavigation();
-  const [question, setQuestion] = useState('');
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
-  const [serverLive, setServerLive] = useState(true);
+  const [cdssQuery, setCdssQuery] = useState('');
+  const [turns, setTurns] = useState<SpokenTurn[]>([]);
   const [showKg, setShowKg] = useState(false);
   const [doctorDoc, setDoctorDoc] = useState<any>(null);
 
-  // Personal 3D likeness & voice state for visual speaking Twin
   const [faceProfile, setFaceProfile] = useState<FaceLikenessData | null>(() =>
     host.readStore<FaceLikenessData | null>(FACE_STORE_KEY, null)
   );
@@ -187,8 +186,6 @@ export function AskPanel({
     })
   );
 
-  // Voice-first by default for patient Ask Your Twin
-  const [autoSpeakReply, setAutoSpeakReply] = useState<boolean>(true);
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
   const [voiceStatusMsg, setVoiceStatusMsg] = useState<string | null>(null);
   const [speakingTurnIdx, setSpeakingTurnIdx] = useState<number | null>(null);
@@ -217,17 +214,11 @@ export function AskPanel({
       computePreservationScore({
         hasTwinRecord: Boolean(b?.patient),
         faceLikenessScore: faceProfile?.likeness_score ?? 0,
-        voiceFidelityScore: voiceProfile?.used_real_audio ? voiceProfile.fidelity_score : 0,
+        voiceFidelityScore: voiceProfile?.fidelity_score ?? 0,
         memoriesCount: memories.length,
       }),
-    [b?.patient, faceProfile?.likeness_score, voiceProfile, memories.length]
+    [b?.patient, faceProfile?.likeness_score, voiceProfile?.fidelity_score, memories.length]
   );
-
-  useEffect(() => {
-    if (host.checkHealth) {
-      host.checkHealth().then(setServerLive).catch(() => setServerLive(false));
-    }
-  }, [host]);
 
   useEffect(() => {
     if (isDoctor && host.loadDoctorDoc) {
@@ -235,7 +226,6 @@ export function AskPanel({
     }
   }, [isDoctor, host]);
 
-  // Re-read per-patient identity state whenever patient switches or voice updates
   useEffect(() => {
     const syncIdentity = () => {
       setVoiceProfile(host.readStore<VoicePersonaData | null>(SHARED_VOICE_STORE_KEY, null));
@@ -291,7 +281,7 @@ export function AskPanel({
     });
   };
 
-  const localFallbackAnswer = (q: string): ChatTurn => {
+  const localFallbackAnswer = (q: string): SpokenTurn => {
     const qLow = q.toLowerCase();
     if (/how am i doing|overall|summary/i.test(qLow)) {
       const topInsights = (b?.insights || [])
@@ -300,13 +290,13 @@ export function AskPanel({
         .join('; ');
       const feedLine =
         pendingFeed.length > 0
-          ? ` You have also logged ${pendingFeed.length} personal update${pendingFeed.length === 1 ? '' : 's'} in Feed Your Twin.`
+          ? ` I have also logged ${pendingFeed.length} recent update${pendingFeed.length === 1 ? '' : 's'} in Feed Your Twin.`
           : '';
       return {
         me: q,
         a: isDoctor
           ? `${patientName}'s record includes ${(b?.insights || []).length} prioritized findings (${topInsights || 'baseline reviewed'}).${feedLine}`
-          : `Looking across my Twin right now, my key tracked priorities are: ${topInsights || 'my baseline clinical markers'}.${feedLine} Everything else measured is stable, and any unmeasured domains remain clearly marked rather than guessed.`,
+          : `Looking across my Twin right now, my main focus areas are: ${topInsights || 'my baseline clinical markers'}.${feedLine} Everything else measured is steady, and anything unmeasured stays clearly marked rather than guessed.`,
         links: (b?.insights || []).slice(0, 2).map((x: any) => x.id),
         sources: [{ kind: 'record', title: `${patientName} longitudinal Twin record` }],
       };
@@ -336,14 +326,14 @@ export function AskPanel({
       me: q,
       a: isDoctor
         ? "That specific analyte or history item isn't in this patient's record yet."
-        : "That isn't in my record yet, so I won't guess. You can add it in Feed Your Twin or review it with your care team.",
+        : "That isn't in my record yet, so I won't guess. I can add it in Feed Your Twin or review it with my doctor.",
       links: [],
     };
   };
 
   const askQuestion = async (
     rawQ: string,
-    opts?: { forceSpeak?: boolean; profileOverride?: VoicePersonaData | null }
+    opts?: { profileOverride?: VoicePersonaData | null }
   ) => {
     const trimmed = rawQ.trim();
     if (!trimmed) return;
@@ -353,9 +343,8 @@ export function AskPanel({
       return;
     }
 
-    // If Live Voice WebSocket is open and user submits text, stream it over the live channel too!
     if (liveModeActive && liveClientRef.current && !isDoctor) {
-      liveClientRef.current.sendTextTurn(trimmed);
+      liveClientRef.current.sendSpokenPromptTurn(trimmed);
       setTurns((prev) => [
         ...prev,
         {
@@ -391,9 +380,9 @@ export function AskPanel({
     }
 
     const activeVoice = opts?.profileOverride ?? voiceProfile;
-    const shouldSpeak = Boolean(!isDoctor && (opts?.forceSpeak || autoSpeakReply));
+    const shouldSpeak = !isDoctor;
 
-    let resolvedTurn: ChatTurn;
+    let resolvedTurn: SpokenTurn;
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 45000);
@@ -452,7 +441,7 @@ export function AskPanel({
           resolvedTurn.audioWavBase64 = synth.audio_wav_base64;
           resolvedTurn.voiceUsed = synth.voice_used;
         } catch {
-          // fallback speech handled by playWithAvatarSync
+          // SpeechSynthesis fallback handled by playWithAvatarSync
         }
       }
     }
@@ -460,11 +449,8 @@ export function AskPanel({
     setTurns((prev) => {
       const copy = [...prev];
       const idx = copy.findIndex((item) => item.pending && item.me === trimmed);
-      if (idx >= 0) {
-        copy[idx] = resolvedTurn;
-      } else {
-        copy.push(resolvedTurn);
-      }
+      if (idx >= 0) copy[idx] = resolvedTurn;
+      else copy.push(resolvedTurn);
       return copy;
     });
 
@@ -511,7 +497,7 @@ export function AskPanel({
       onOutputTranscript: (chunk) => {
         liveOutputAccRef.current = `${liveOutputAccRef.current}${chunk}`;
         const curOut = liveOutputAccRef.current.trim();
-        const curIn = liveInputAccRef.current.trim() || 'Spoken live to Twin';
+        const curIn = liveInputAccRef.current.trim() || 'Spoken live';
         setTurns((prev) => {
           const copy = [...prev];
           const lastIdx = copy.length - 1;
@@ -552,6 +538,7 @@ export function AskPanel({
     try {
       await client.connect({
         patientName,
+        patientSex: b?.patient?.sex,
         bundle: {
           ...b,
           pending_feed: pendingFeed,
@@ -561,25 +548,19 @@ export function AskPanel({
         apiBase: host.apiBase,
         enableMic: true,
       });
-    } catch (err: any) {
+    } catch {
       setLiveModeActive(false);
       setConvState('idle');
-      setLiveStatusDetail(
-        err?.message || 'Live voice WebSocket unavailable — use Speak Question below.'
-      );
+      setLiveStatusDetail('Live stream unavailable — tap the microphone button to speak.');
     }
   };
 
-  const handleVoiceAudioBlob = async (blob: Blob, fallbackHint?: string) => {
+  const handleVoiceAudioBlob = async (blob: Blob) => {
     const canRefineProfile = Boolean(
       voiceConsent.consented && voiceConsent.allowConversationalRefinement
     );
     setConvState('thinking');
-    setVoiceStatusMsg(
-      canRefineProfile
-        ? 'Transcribing spoken question & refining your consented voice profile…'
-        : 'Transcribing your spoken question…'
-    );
+    setVoiceStatusMsg('Listening to your question…');
     try {
       const [acoustics, b64] = await Promise.all([
         analyzeBlobAcoustics(blob),
@@ -591,9 +572,11 @@ export function AskPanel({
         sourceType: 'conversation_audio',
         consentVerified: canRefineProfile,
         measuredPitchHz: acoustics.pitchHz,
+        measuredPitchRangeHz: acoustics.pitchRangeHz,
         measuredBrightness: acoustics.brightness,
-        transcriptHint:
-          fallbackHint || question.trim() || 'How am I doing overall right now?',
+        measuredWpm: acoustics.cadenceWpm,
+        formantBands: acoustics.formantBands,
+        transcriptHint: 'How am I doing overall right now?',
         patientName,
         existingProfile: voiceProfile,
         apiBase: host.apiBase,
@@ -605,35 +588,29 @@ export function AskPanel({
         nextProfile = trained.profile;
       }
 
-      setAutoSpeakReply(true);
-      const askedText =
-        trained.transcript?.trim() || question.trim() || 'How am I doing overall right now?';
-      setQuestion('');
-      setVoiceStatusMsg(
-        nextProfile
-          ? `Speaking answer in your voice (${nextProfile.prebuilt_voice} · ${
-              nextProfile.pitch_hz || acoustics.pitchHz || 178
-            } Hz · SNR ${acoustics.quality.snrDb} dB)`
-          : 'Spoken question transcribed — enable Voice Preservation in Preserve Yourself to save your personal voice.'
-      );
-      await askQuestion(askedText, {
-        forceSpeak: true,
-        profileOverride: nextProfile,
-      });
+      const askedText = trained.transcript?.trim() || 'How am I doing overall right now?';
+      setVoiceStatusMsg(null);
+      await askQuestion(askedText, { profileOverride: nextProfile });
     } catch (err: any) {
       setConvState('idle');
-      setVoiceStatusMsg(err?.message || 'Could not process voice recording.');
+      setVoiceStatusMsg(err?.message || 'Could not process voice audio.');
     }
   };
 
   const handleToggleMicQuestion = async () => {
+    if (isAvatarSpeaking) {
+      stopActiveVoicePlayback();
+      setIsAvatarSpeaking(false);
+      setConvState('idle');
+      return;
+    }
     if (isRecordingVoice && mediaRecRef.current) {
       mediaRecRef.current.stop();
       setIsRecordingVoice(false);
       return;
     }
     if (!navigator.mediaDevices?.getUserMedia) {
-      setVoiceStatusMsg('Microphone unavailable here — upload an audio clip or try Sample voice.');
+      await askQuestion('How am I doing overall right now?');
       return;
     }
     try {
@@ -654,46 +631,10 @@ export function AskPanel({
       rec.start();
       setIsRecordingVoice(true);
       setConvState('listening');
-      setVoiceStatusMsg('Listening… ask "How am I doing?" aloud, then click Stop & Ask.');
+      setVoiceStatusMsg('Listening… tap again when finished speaking.');
     } catch {
       setConvState('idle');
-      setVoiceStatusMsg('Microphone permission declined — upload an audio clip or try Sample voice.');
-    }
-  };
-
-  const handleSampleVoiceAsk = async () => {
-    const promptToAsk = question.trim() || 'How am I doing overall right now?';
-    setConvState('thinking');
-    setVoiceStatusMsg('Calibrating your vocal timbre & synthesizing spoken self-perspective answer…');
-    try {
-      const sampleWav = createSampleVoiceWavBase64(0.85, b?.patient?.sex === 'male' ? 128 : 184);
-      const trained = await trainAndTranscribeUserVoice({
-        audioBase64: sampleWav,
-        mimeType: 'audio/wav',
-        sourceType: 'recorded_audio',
-        consentVerified: true,
-        measuredPitchHz: b?.patient?.sex === 'male' ? 128 : 184,
-        measuredBrightness: 60,
-        transcriptHint: promptToAsk,
-        patientName,
-        existingProfile: voiceProfile,
-        apiBase: host.apiBase,
-      });
-      persistVoiceProfile(trained.profile);
-      setAutoSpeakReply(true);
-      setQuestion('');
-      setVoiceStatusMsg(
-        `Voice matched (${trained.profile.prebuilt_voice} · ${
-          trained.profile.pitch_hz || 184
-        } Hz) — speaking as your Twin`
-      );
-      await askQuestion(promptToAsk, {
-        forceSpeak: true,
-        profileOverride: trained.profile,
-      });
-    } catch (err: any) {
-      setConvState('idle');
-      setVoiceStatusMsg(err?.message || 'Sample voice run failed.');
+      setVoiceStatusMsg('Microphone unavailable — tap a spoken prompt below or upload audio.');
     }
   };
 
@@ -736,13 +677,6 @@ export function AskPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initial]);
 
-  const submitCurrent = () => {
-    if (!question.trim()) return;
-    const q = question.trim();
-    setQuestion('');
-    void askQuestion(q);
-  };
-
   const CrisisBanner = host.CrisisBanner;
   const cdssSuggestions = host.cdssPrompts || [
     'What should we check next?',
@@ -751,7 +685,6 @@ export function AskPanel({
     'Results outside range',
   ];
 
-  // Strictly first-person self-perspective prompts ("How am I doing?", never "How are you doing?")
   const patientSuggestions = useMemo(
     () => buildSelfPerspectivePrompts(b, pendingFeed.length, memories.length),
     [b, pendingFeed.length, memories.length]
@@ -764,102 +697,264 @@ export function AskPanel({
     return liveAudioLevelRef.current;
   };
 
-  const content = (
-    <>
-      {!embedded && <h1>{isDoctor ? 'Clinical assistant' : 'Speak with your twin'}</h1>}
-      <p className="lede">
-        {isDoctor
-          ? `Clinical decision support: grounded in ${patientName}’s Knowledge Graph, uploaded lab reports, and live Google Search clinical guidelines. For physician review; never diagnoses or prescribes.`
-          : serverLive
-            ? 'Speak naturally as yourself — ask "How am I doing?" and your Twin answers in first person using your preserved voice, 3D likeness, longitudinal health data, and grounded medical evidence.'
-            : 'Your Twin answers strictly from your longitudinal health record, personal updates, and verified medical evidence.'}
-      </p>
+  // === PHYSICIAN CDSS VIEW (Doctor Mode only) ===
+  if (isDoctor) {
+    const submitCdss = () => {
+      if (!cdssQuery.trim()) return;
+      const q = cdssQuery.trim();
+      setCdssQuery('');
+      void askQuestion(q);
+    };
 
-      {/* Visual Speaking 3D Twin Presence for Patient Self-Perspective Mode */}
-      {!isDoctor && (
-        <section className="card mx-ask-twin-presence" aria-label="Visual speaking Twin">
-          <PreserveAvatarStage
-            patientName={patientName}
-            convergencePct={convergence.totalPct}
-            stageLabel={convergence.stageLabel}
-            faceProfile={faceProfile}
-            portraitDataUrl={portraitDataUrl}
-            isSpeaking={isAvatarSpeaking}
-            cadenceWpm={voiceProfile?.cadence_wpm || 148}
-            getAudioLevel={getCombinedAudioLevel}
-            compact
-            conversationState={convState}
-            bundle={b}
-            PatientTwin3D={host.PatientTwin3D}
+    const cdssBody = (
+      <>
+        {!embedded && <h1>Clinical assistant</h1>}
+        <p className="lede">
+          Grounded in {patientName}’s Knowledge Graph, lab trends, and clinical guidelines. For
+          physician review.
+        </p>
+
+        <div className="ask-box">
+          <textarea
+            aria-label="Clinical question"
+            placeholder="Ask about next tests, treatment options, interactions, genes, or recent report changes…"
+            value={cdssQuery}
+            onChange={(e) => setCdssQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                submitCdss();
+              }
+            }}
           />
+          <button className="primary" onClick={submitCdss}>
+            Ask
+          </button>
+        </div>
 
-          <div className="mx-ask-presence-bar">
-            <div className="mx-ask-presence-actions">
-              <button
-                type="button"
-                className={liveModeActive ? 'primary sm' : 'secondary sm'}
-                onClick={() => void handleToggleLiveVoice()}
-              >
-                {liveModeActive ? 'End Live Voice Call' : 'Start Live Voice Conversation'}
+        {turns.length === 0 && (
+          <div className="suggest">
+            {cdssSuggestions.map((prompt) => (
+              <button key={prompt} type="button" onClick={() => void askQuestion(prompt)}>
+                {prompt}
               </button>
-
-              <button
-                type="button"
-                className={isRecordingVoice ? 'primary sm' : 'secondary sm'}
-                onClick={() => void handleToggleMicQuestion()}
-              >
-                {isRecordingVoice ? 'Stop & Ask ("How am I doing?")' : 'Speak Question'}
-              </button>
-
-              <button
-                type="button"
-                className="secondary sm"
-                onClick={() => void handleSampleVoiceAsk()}
-              >
-                Demo My Voice ("How am I doing?")
-              </button>
-            </div>
-
-            <div className="mx-ask-presence-meta">
-              <span className="note mx-tabular">
-                {voiceProfile?.used_real_audio
-                  ? `Your voice active: ${voiceProfile.prebuilt_voice} · ${
-                      voiceProfile.pitch_hz || 175
-                    } Hz (${voiceProfile.fidelity_score}% match)`
-                  : 'Baseline voice · calibrate your real voice in Preserve Yourself'}
-              </span>
-              <button
-                type="button"
-                className="link"
-                onClick={() => navigate('#/you/preserve')}
-              >
-                Customize 3D &amp; Voice →
-              </button>
-            </div>
+            ))}
           </div>
+        )}
 
-          {liveStatusDetail && (
-            <p className="note" role="status">
-              {liveStatusDetail}
-            </p>
+        <div className="mx-turns-stack">
+          {turns.map((turn, idx) => (
+            <div key={`${turn.me}-${idx}`} className="mx-turn-pair">
+              <div className="bubble me">{turn.me}</div>
+              {turn.pending && !turn.a ? (
+                <div className="bubble ask-pending">Checking record &amp; clinical guidelines…</div>
+              ) : (
+                <div className="bubble mx-answer-bubble">
+                  <p className="mx-answer-text">{turn.a}</p>
+                  {turn.sources && turn.sources.length > 0 && (
+                    <CitationsList
+                      sources={turn.sources}
+                      openFinding={openFinding}
+                      insights={b?.insights || []}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </>
+    );
+
+    return embedded ? <div className="ask-wrap">{cdssBody}</div> : <main className="screen">{cdssBody}</main>;
+  }
+
+  // === PATIENT MODE: PURE VOICE-ONLY SPEAKING TWIN (ZERO TEXT CHAT BOX) ===
+  const activeTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const activeTurnIdx = turns.length - 1;
+
+  const voiceOnlyContent = (
+    <div className="mx-voice-only-studio" data-testid="voice-only-ask">
+      {!embedded && (
+        <div className="mx-voice-head">
+          <h1>Speak with your twin</h1>
+          <p className="note">
+            Ask “How am I doing?” aloud — your Twin answers in your own voice.
+          </p>
+        </div>
+      )}
+
+      {/* Visual 3D Speaking Twin Stage */}
+      <PreserveAvatarStage
+        patientName={patientName}
+        convergencePct={convergence.totalPct}
+        stageLabel={convergence.stageLabel}
+        faceProfile={faceProfile}
+        portraitDataUrl={portraitDataUrl}
+        isSpeaking={isAvatarSpeaking}
+        cadenceWpm={voiceProfile?.cadence_wpm || 144}
+        getAudioLevel={getCombinedAudioLevel}
+        compact
+        conversationState={convState}
+        bundle={b}
+        PatientTwin3D={host.PatientTwin3D}
+      />
+
+      {/* Tactile Voice Orb & Live Stream Controls — ZERO text input box */}
+      <div className="mx-voice-orb-dock">
+        <button
+          type="button"
+          className={`mx-mic-orb state-${convState}${isRecordingVoice ? ' is-rec' : ''}`}
+          onClick={() => void handleToggleMicQuestion()}
+          aria-label={
+            isAvatarSpeaking
+              ? 'Stop speaking'
+              : isRecordingVoice
+                ? 'Stop and ask'
+                : 'Tap to speak with your twin'
+          }
+        >
+          <span className="mx-mic-orb-icon" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              width="24"
+              height="24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" y1="19" x2="12" y2="22" />
+            </svg>
+          </span>
+          <b>
+            {isAvatarSpeaking
+              ? 'Speaking… tap to stop'
+              : isRecordingVoice
+                ? 'Listening… tap to send'
+                : convState === 'thinking'
+                  ? 'Thinking…'
+                  : 'Tap to speak'}
+          </b>
+        </button>
+
+        <div className="mx-voice-secondary-controls">
+          <button
+            type="button"
+            className={liveModeActive ? 'primary sm' : 'secondary sm'}
+            onClick={() => void handleToggleLiveVoice()}
+          >
+            {liveModeActive ? 'End live call' : 'Live conversation'}
+          </button>
+
+          <label className="secondary sm mx-file-btn">
+            <span>Upload audio</span>
+            <input
+              type="file"
+              accept="audio/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleVoiceAudioBlob(f);
+                e.currentTarget.value = '';
+              }}
+            />
+          </label>
+
+          <button
+            type="button"
+            className="link"
+            onClick={() => navigate('#/you/preserve')}
+          >
+            {voiceProfile
+              ? `${voiceProfile.prebuilt_voice} · ${voiceProfile.pitch_hz || 175} Hz`
+              : 'Calibrate my voice →'}
+          </button>
+        </div>
+
+        {(voiceStatusMsg || liveStatusDetail) && (
+          <p className="note" role="status">
+            {voiceStatusMsg || liveStatusDetail}
+          </p>
+        )}
+      </div>
+
+      {/* Active Spoken Response Caption */}
+      {activeTurn && (
+        <section className="card mx-spoken-response-card" aria-live="polite">
+          <small className="note">You asked: “{activeTurn.me}”</small>
+
+          {activeTurn.crisis && CrisisBanner ? (
+            <CrisisBanner />
+          ) : activeTurn.pending && !activeTurn.a ? (
+            <p className="note">Checking your Twin record &amp; evidence…</p>
+          ) : (
+            <>
+              <p className="mx-spoken-reply-text">{activeTurn.a}</p>
+
+              <div className="mx-ab-voice-bar">
+                <button
+                  type="button"
+                  className="secondary sm"
+                  disabled={speakingTurnIdx === activeTurnIdx}
+                  onClick={() => void handleSpeakTurn(activeTurnIdx)}
+                >
+                  {speakingTurnIdx === activeTurnIdx ? 'Synthesizing…' : '▶ Replay in my voice'}
+                </button>
+                {activeTurn.voiceUsed && <small className="note">{activeTurn.voiceUsed}</small>}
+              </div>
+
+              {activeTurn.links.length > 0 && (
+                <div className="suggest mx-insight-links">
+                  {activeTurn.links.map((fid) => (
+                    <button key={fid} type="button" onClick={() => openFinding(fid)}>
+                      {b?.insights?.find((x: any) => x.id === fid)?.title || fid} →
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {activeTurn.sources && activeTurn.sources.length > 0 && (
+                <details className="mx-quiet-details">
+                  <summary>Sources ({activeTurn.sources.length})</summary>
+                  <CitationsList
+                    sources={activeTurn.sources}
+                    openFinding={openFinding}
+                    insights={b?.insights || []}
+                  />
+                </details>
+              )}
+            </>
           )}
         </section>
       )}
 
+      {/* One-Tap Self-Perspective Spoken Prompts */}
+      <div className="suggest mx-voice-prompts" aria-label="Spoken prompts">
+        {patientSuggestions.slice(0, 5).map((prompt) => (
+          <button
+            key={prompt}
+            type="button"
+            disabled={convState === 'thinking'}
+            onClick={() => void askQuestion(prompt)}
+          >
+            {prompt}
+          </button>
+        ))}
+      </div>
+
+      {/* Quiet Knowledge Graph toggle */}
       <div className="mx-kg-toggle-row">
         <button
           type="button"
-          className="secondary sm mx-kg-toggle-btn"
+          className="link"
           onClick={() => setShowKg((v) => !v)}
           aria-expanded={showKg}
         >
-          {showKg ? 'Hide Knowledge Graph' : 'Show Twin Knowledge Graph'}
+          {showKg ? 'Hide Twin Knowledge Graph' : 'View Twin Knowledge Graph'}
         </button>
-        <span className="note">
-          {isDoctor
-            ? 'Clinical Knowledge Graph + Google Search grounding'
-            : 'First-person Twin memory + Knowledge Graph + Personal Voice'}
-        </span>
       </div>
 
       {showKg && (
@@ -873,201 +968,86 @@ export function AskPanel({
           />
         </div>
       )}
-
-      <div className="ask-box">
-        <textarea
-          aria-label="Your question"
-          placeholder={
-            isDoctor
-              ? 'Ask about next tests, treatment options, interactions, genes, or recent report changes...'
-              : 'Ask yourself: "How am I doing overall right now?", "What changed in my health recently?", or "How have I been sleeping?"'
-          }
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              submitCurrent();
-            }
-          }}
-        />
-        <button className="primary" onClick={submitCurrent}>
-          {liveModeActive && !isDoctor ? 'Send Live' : 'Ask'}
-        </button>
-      </div>
-
-      {/* Voice Upload & Auto-Speak Controls */}
-      <div className="mx-voice-bar">
-        <div className="mx-voice-bar-btns">
-          <label className="secondary sm mx-file-btn">
-            <span>Upload voice question</span>
-            <input
-              type="file"
-              accept="audio/*"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void handleVoiceAudioBlob(f);
-                e.currentTarget.value = '';
-              }}
-            />
-          </label>
-
-          {isAvatarSpeaking && (
-            <button
-              type="button"
-              className="secondary sm"
-              onClick={() => {
-                stopActiveVoicePlayback();
-                setIsAvatarSpeaking(false);
-                setConvState(liveModeActive ? 'listening' : 'idle');
-              }}
-            >
-              Stop speaking
-            </button>
-          )}
-        </div>
-
-        {!isDoctor && (
-          <label className="mx-voice-toggle">
-            <input
-              type="checkbox"
-              checked={autoSpeakReply}
-              onChange={(e) => setAutoSpeakReply(e.target.checked)}
-            />
-            <span>
-              Speak replies aloud in my voice
-              {voiceProfile
-                ? ` (${voiceProfile.prebuilt_voice} · ${voiceProfile.pitch_hz || 175} Hz)`
-                : ''}
-            </span>
-          </label>
-        )}
-      </div>
-
-      {voiceStatusMsg && (
-        <p className="note" role="status">
-          {voiceStatusMsg}
-        </p>
-      )}
-
-      {turns.length === 0 && (
-        <div className="suggest" aria-label="Suggested questions for your Twin">
-          {(isDoctor ? cdssSuggestions : patientSuggestions).map((prompt) => (
-            <button key={prompt} type="button" onClick={() => void askQuestion(prompt)}>
-              {prompt}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <div className="mx-turns-stack">
-        {turns.map((turn, idx) => (
-          <div key={`${turn.me}-${idx}`} className="mx-turn-pair">
-            <div className="bubble me">{turn.me}</div>
-
-            {turn.crisis && CrisisBanner ? (
-              <CrisisBanner />
-            ) : turn.pending && !turn.a ? (
-              <div className="bubble ask-pending">
-                <span className="ap-dots" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                </span>
-                Checking your Twin record, longitudinal updates &amp; medical evidence…
-              </div>
-            ) : (
-              <div className="bubble mx-answer-bubble">
-                <div className="mx-answer-top-bar">
-                  {turn.cdss ? (
-                    <span className="ask-live">Clinical decision support · Grounded</span>
-                  ) : turn.liveVoice ? (
-                    <span className="ask-live">Live bidirectional voice · Personal Twin</span>
-                  ) : turn.live ? (
-                    <span className="ask-live">Self-perspective · KG + Google Search</span>
-                  ) : (
-                    <span className="ask-live">Grounded in your Twin record</span>
-                  )}
-
-                  <button
-                    type="button"
-                    className="secondary sm"
-                    disabled={speakingTurnIdx === idx}
-                    onClick={() => void handleSpeakTurn(idx)}
-                  >
-                    {speakingTurnIdx === idx
-                      ? 'Synthesizing voice…'
-                      : turn.audioWavBase64
-                        ? 'Replay in my voice'
-                        : 'Speak in my voice'}
-                  </button>
-                </div>
-
-                <p className="mx-answer-text">{turn.a}</p>
-
-                {turn.audioWavBase64 && (
-                  <div className="mx-matched-audio-controls">
-                    <audio
-                      controls
-                      src={`data:audio/wav;base64,${turn.audioWavBase64}`}
-                      className="mx-inline-audio"
-                      onPlay={() => {
-                        setIsAvatarSpeaking(true);
-                        setConvState('speaking');
-                      }}
-                      onPause={() => {
-                        setIsAvatarSpeaking(false);
-                        setConvState('idle');
-                      }}
-                      onEnded={() => {
-                        setIsAvatarSpeaking(false);
-                        setConvState('idle');
-                      }}
-                    />
-                    {turn.voiceUsed && <small className="note">{turn.voiceUsed}</small>}
-                  </div>
-                )}
-
-                {turn.sources && turn.sources.length > 0 && (
-                  <CitationsList
-                    sources={turn.sources}
-                    openFinding={openFinding}
-                    insights={b?.insights || []}
-                  />
-                )}
-
-                {turn.links.length > 0 && (
-                  <div className="suggest mx-insight-links">
-                    {turn.links.map((fid) => (
-                      <button key={fid} type="button" onClick={() => openFinding(fid)}>
-                        Read: {b?.insights?.find((x: any) => x.id === fid)?.title || fid}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-
-      {turns.length > 0 && (
-        <div className="suggest">
-          {(isDoctor ? cdssSuggestions : patientSuggestions)
-            .filter((q) => !turns.some((t) => t.me === q))
-            .slice(0, 4)
-            .map((q) => (
-              <button key={q} type="button" onClick={() => void askQuestion(q)}>
-                {q}
-              </button>
-            ))}
-        </div>
-      )}
-    </>
+    </div>
   );
 
   if (embedded) {
-    return <div className="ask-wrap">{content}</div>;
+    return <div className="ask-wrap">{voiceOnlyContent}</div>;
   }
-  return <main className="screen">{content}</main>;
+  return <main className="screen">{voiceOnlyContent}</main>;
+}
+
+/**
+ * Replaces the legacy bottom text chat input bar (`f_`) on #/twin with a clean,
+ * voice-only floating launcher button that opens the Speaking Twin sheet.
+ */
+export function FloatingVoiceLauncher({
+  b,
+  go,
+  show,
+  doctor,
+  Sheet,
+  AskComp,
+}: {
+  b: any;
+  go: (tab: string, sub?: string) => void;
+  show: boolean;
+  doctor: boolean;
+  Sheet: any;
+  AskComp: any;
+}) {
+  const [open, setOpen] = useState(false);
+
+  if (!show) return null;
+
+  return (
+    <>
+      <div className="mx-floating-voice-wrap">
+        <button
+          type="button"
+          className="mx-floating-voice-pill"
+          onClick={() => setOpen(true)}
+          aria-label={doctor ? 'Open clinical assistant' : 'Speak with your twin'}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="17"
+            height="17"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="22" />
+          </svg>
+          <span>{doctor ? 'Clinical assistant' : 'Speak with your twin'}</span>
+        </button>
+      </div>
+
+      {open && Sheet && AskComp && (
+        <Sheet
+          title={doctor ? 'Clinical assistant' : 'Speak with your twin'}
+          center
+          onClose={() => {
+            stopActiveVoicePlayback();
+            setOpen(false);
+          }}
+        >
+          <AskComp
+            b={b}
+            embedded
+            openFinding={(fid: string) => {
+              stopActiveVoicePlayback();
+              setOpen(false);
+              go('research', `f:${fid}`);
+            }}
+          />
+        </Sheet>
+      )}
+    </>
+  );
 }

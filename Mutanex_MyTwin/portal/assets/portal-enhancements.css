@@ -1936,4 +1936,507 @@ body {
   }
 }
 
+/* =========================================================================
+   10. Minimal Twin-Matched Preserve Yourself (`twin4`) & Voice-Only Studio
+   ========================================================================= */
 
+.mx-bento-preserve-min {
+  grid-column: 1 / -1;
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 12px;
+  padding: 13px 16px !important;
+  border-color: var(--border) !important;
+  background: var(--surface) !important;
+}
+
+.mx-bento-preserve-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  text-align: left;
+}
+
+.mx-bento-preserve-left > span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mx-bento-preserve-min b {
+  font-size: 0.94rem;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.2;
+}
+
+.mx-bento-preserve-min small {
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.25;
+}
+
+.mx-bento-preserve-arrow {
+  color: var(--muted);
+  font-size: 1.15rem;
+  line-height: 1;
+  flex: none;
+}
+
+/* Twin4-matched Preserve Yourself Split Layout */
+.mx-preserve-stage-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mx-preserve-pct-pill {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: #0b6470;
+  background: #eaf7f8;
+  border: 1px solid #c3e6ea;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mx-preserve-title-block {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 4px;
+}
+
+.mx-preserve-h1 {
+  margin: 0 !important;
+  font-size: 1.55rem;
+  line-height: 1.15;
+}
+
+.mx-preserve-sub {
+  margin: 0 !important;
+  font-size: 0.82rem;
+}
+
+.mx-preserve-twin-view {
+  position: relative;
+  width: 100%;
+  min-height: 440px;
+  overflow: hidden;
+}
+
+.mx-preserve-twin-view.is-compact {
+  min-height: 300px;
+  height: 310px;
+  border-radius: 20px;
+}
+
+.mx-preserve-fallback-light {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+}
+
+.mx-stage-voice-btn {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 7px;
+  padding: 0 14px !important;
+  height: 38px !important;
+  width: auto !important;
+  border-radius: 999px !important;
+}
+
+.mx-stage-voice-btn em {
+  font-style: normal;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.mx-stage-voice-btn.is-rec {
+  background: #0f766e !important;
+  color: #ffffff !important;
+}
+
+.mx-preserve-panel {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  min-width: 0;
+}
+
+.mx-preserve-segbar {
+  width: 100%;
+  display: grid !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.mx-preserve-segbar button {
+  text-align: center;
+  justify-content: center;
+}
+
+.mx-voice-traits-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.mx-read-aloud-prompt {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  color: var(--ink);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.mx-memory-form {
+  display: grid;
+  gap: 8px;
+}
+
+.mx-memory-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mx-memory-input-row select {
+  flex: 1 1 auto;
+  min-height: 38px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong, #c5d3d5);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.mx-memory-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.mx-preserve-voice-card {
+  display: grid;
+  gap: 10px;
+}
+
+.mx-preserve-turn-min {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.mx-preserve-turn-min p {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.mx-quiet-details {
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding: 4px 2px;
+}
+
+.mx-quiet-details summary {
+  cursor: pointer;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.mx-quiet-details p {
+  margin: 6px 0 0;
+}
+
+/* Pure Voice-Only Speaking Twin Studio */
+.mx-voice-only-studio {
+  display: grid;
+  gap: 16px;
+  max-width: 680px;
+  margin: 0 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.mx-voice-head {
+  text-align: center;
+  display: grid;
+  gap: 4px;
+}
+
+.mx-voice-head h1,
+.mx-voice-head p {
+  margin: 0 !important;
+}
+
+.mx-voice-orb-dock {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.mx-mic-orb {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 24px 12px 14px;
+  border-radius: 999px;
+  border: 1px solid #9fdbe0;
+  background: linear-gradient(180deg, #ffffff 0%, #effafb 100%);
+  color: var(--ink);
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(10, 64, 72, 0.08);
+  transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.mx-mic-orb:hover {
+  border-color: var(--teal);
+  transform: translateY(-1px);
+}
+
+.mx-mic-orb-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: var(--teal, #05b7b9);
+  color: #ffffff;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.mx-mic-orb.state-listening,
+.mx-mic-orb.is-rec {
+  border-color: #05b7b9;
+  box-shadow: 0 0 0 6px rgba(5, 183, 185, 0.16);
+}
+
+.mx-mic-orb.state-speaking {
+  border-color: #0097b2;
+  box-shadow: 0 0 0 6px rgba(0, 151, 178, 0.14);
+}
+
+.mx-mic-orb b {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.mx-voice-secondary-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px 12px;
+}
+
+.mx-spoken-response-card {
+  display: grid;
+  gap: 10px;
+  border-color: #c7e7eb !important;
+}
+
+.mx-spoken-reply-text {
+  margin: 0;
+  font-size: 0.96rem;
+  line-height: 1.58;
+  color: var(--ink);
+}
+
+.mx-voice-prompts {
+  justify-content: center;
+}
+
+/* Preserved Portrait Medallion & Live Vocal Resonance on Stage */
+.mx-stage-portrait-dock {
+  position: absolute;
+  top: 58px;
+  left: 14px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 12px 6px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(15, 118, 130, 0.2);
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(10px);
+  color: var(--ink);
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(10, 50, 58, 0.08);
+  transition: border-color 0.16s ease, transform 0.16s ease;
+}
+
+.mx-stage-portrait-dock:hover {
+  border-color: var(--teal);
+  transform: translateY(-1px);
+}
+
+.mx-stage-portrait-dock.is-speaking {
+  border-color: #05b7b9;
+  box-shadow: 0 0 0 4px rgba(5, 183, 185, 0.16);
+}
+
+.mx-stage-portrait-ring-wrap {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: none;
+}
+
+.mx-stage-portrait-img {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1.5px solid #8fd8df;
+  display: block;
+}
+
+.mx-stage-portrait-pulse {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid #05b7b9;
+  opacity: 0.75;
+  animation: mxVoiceRingPulse 1.15s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes mxVoiceRingPulse {
+  0%,
+  100% {
+    transform: scale(0.98);
+    opacity: 0.75;
+  }
+  50% {
+    transform: scale(1.1);
+    opacity: 0.25;
+  }
+}
+
+.mx-stage-portrait-meta {
+  display: grid;
+  text-align: left;
+  line-height: 1.15;
+}
+
+.mx-stage-portrait-meta b {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.mx-stage-portrait-meta small {
+  font-size: 0.72rem;
+  color: #0b6470;
+  font-variant-numeric: tabular-nums;
+}
+
+.mx-stage-organ-pill {
+  position: absolute;
+  bottom: 50px;
+  left: 14px;
+  right: 14px;
+  max-width: 360px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid #b8e4e9;
+  font-size: 0.8rem;
+  color: var(--ink);
+  box-shadow: 0 6px 18px rgba(10, 50, 58, 0.08);
+}
+
+.mx-stage-live-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mx-live-wave-bars {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 18px;
+}
+
+.mx-live-wave-bars i {
+  display: block;
+  width: 3px;
+  border-radius: 99px;
+  background: #05b7b9;
+  transition: height 0.07s ease;
+}
+
+/* Floating Voice Pill Launcher on #/twin (replaces text askbar) */
+.mx-floating-voice-wrap {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 40;
+  pointer-events: none;
+}
+
+@media (min-width: 980px) {
+  .mx-floating-voice-wrap {
+    left: min(555px, 40vw);
+  }
+}
+
+.mx-floating-voice-pill {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  height: 42px;
+  padding: 0 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(5, 183, 185, 0.42);
+  background: #0d2b30;
+  color: #f3fcfd;
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 10px 26px rgba(8, 32, 36, 0.22);
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.mx-floating-voice-pill:hover {
+  background: #113a41;
+  transform: translateY(-1px);
+}
+
+@media (max-width: 820px) {
+  .mx-floating-voice-wrap {
+    bottom: 76px;
+  }
+
+  .mx-preserve-twin-view {
+    min-height: 350px;
+  }
+}

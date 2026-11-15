@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { AskPanel } from './ask';
+import React from 'react';
+import { AskPanel, FloatingVoiceLauncher } from './ask';
 import { AuthProvider, usePortalAuth } from './auth-context';
 import { BackButton } from './back-button';
 import { ClinicianBriefingCard } from './clinician-briefing';
@@ -24,7 +24,6 @@ export function SwitcherExtras({
   onCloseSheet?: () => void;
   setDoctorMode?: (on: boolean) => void;
 }) {
-  const [showTour, setShowTour] = useState(false);
   const { navigate } = usePortalNavigation();
 
   const navigateHash = (hashRoute: string, doctor?: boolean) => {
@@ -38,58 +37,38 @@ export function SwitcherExtras({
   };
 
   return (
-    <>
-      <div className="mx-switcher-extras">
-        <button
-          type="button"
-          className="secondary sm"
-          onClick={() => {
-            try {
-              localStorage.removeItem('mx-onb-flow-v1');
-            } catch {
-              // ignore
-            }
-            navigateHash('#/welcome', false);
-          }}
-        >
-          + Onboard a new person
-        </button>
+    <div className="mx-switcher-extras">
+      <button
+        type="button"
+        className="secondary sm"
+        onClick={() => {
+          try {
+            localStorage.removeItem('mx-onb-flow-v1');
+          } catch {
+            // ignore
+          }
+          navigateHash('#/welcome', false);
+        }}
+      >
+        + Onboard a new person
+      </button>
 
-        <button
-          type="button"
-          className="secondary sm"
-          onClick={() => navigateHash('#/you/checkin:ask', false)}
-        >
-          Ask your twin ("How am I doing?")
-        </button>
+      <button
+        type="button"
+        className="secondary sm"
+        onClick={() => navigateHash('#/you/checkin:ask', false)}
+      >
+        Speak with twin
+      </button>
 
-        <button
-          type="button"
-          className="secondary sm"
-          onClick={() => navigateHash('#/you/preserve', false)}
-        >
-          Preserve yourself (3D + Voice)
-        </button>
-
-        <button
-          type="button"
-          className="secondary sm"
-          onClick={() => setShowTour(true)}
-        >
-          1-Min Product Video &amp; Sandbox
-        </button>
-      </div>
-
-      {showTour && (
-        <ProductTourModal
-          onClose={() => setShowTour(false)}
-          onNavigateSandbox={(route, enableDoctor) => {
-            setShowTour(false);
-            navigateHash(route, enableDoctor);
-          }}
-        />
-      )}
-    </>
+      <button
+        type="button"
+        className="secondary sm"
+        onClick={() => navigateHash('#/you/preserve', false)}
+      >
+        Preserve yourself
+      </button>
+    </div>
   );
 }
 
@@ -103,6 +82,7 @@ const portalEnhancements = {
   OnboardingFlow,
   ProductTourModal,
   AskPanel,
+  FloatingVoiceLauncher,
   ClinicianBriefingCard,
   KnowledgeGraphCard,
   FeedScreen,

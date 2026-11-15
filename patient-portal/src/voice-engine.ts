@@ -1,8 +1,14 @@
 import {
   analyzeAudioSamplesQuality,
-  estimateAutocorrelationPitchHz,
+  estimateAutocorrelationPitchStats,
+  estimateFormantBands,
   estimateSpectralBrightness,
+  estimateSyllableCadenceWpm,
   type AudioQualityReport,
+  type FormantBandProfile,
+  type SpeakingPace,
+  type VocalRegister,
+  type VoiceAccent,
   type VoicePersonaData,
   type VoiceProvenanceType,
 } from './preserve-math';
@@ -66,12 +72,15 @@ export function float32ToPcm16Base64(float32: Float32Array): string {
 
 /**
  * Decodes a recorded microphone or uploaded audio Blob via Web Audio API
- * to measure the speaker's actual fundamental pitch F0 (Hz), spectral brightness,
- * and signal-to-noise quality report.
+ * to measure the speaker's actual fundamental pitch F0 (Hz), pitch range,
+ * 4-band formant envelope, speaking cadence (WPM), and SNR quality report.
  */
 export async function analyzeBlobAcoustics(blob: Blob): Promise<{
   pitchHz: number | null;
+  pitchRangeHz: number | null;
   brightness: number;
+  cadenceWpm: number;
+  formantBands: FormantBandProfile;
   quality: AudioQualityReport;
 }> {
   const defaultQuality: AudioQualityReport = {
@@ -81,28 +90,52 @@ export async function analyzeBlobAcoustics(blob: Blob): Promise<{
     clipping: false,
     qualityLabel: 'Good',
   };
+  const defaultBands: FormantBandProfile = { low: 62, mid: 68, presence: 64, air: 52 };
 
   try {
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) {
-      return { pitchHz: null, brightness: 58, quality: defaultQuality };
+      return {
+        pitchHz: null,
+        pitchRangeHz: null,
+        brightness: 58,
+        cadenceWpm: 140,
+        formantBands: defaultBands,
+        quality: defaultQuality,
+      };
     }
     const arrayBuf = await blob.arrayBuffer();
     const ctx = new AudioCtx();
     try {
       const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
       const chan = audioBuf.getChannelData(0);
-      const pitchHz = estimateAutocorrelationPitchHz(chan, audioBuf.sampleRate);
+      const pitchStats = estimateAutocorrelationPitchStats(chan, audioBuf.sampleRate);
       const brightness = estimateSpectralBrightness(chan, audioBuf.sampleRate);
+      const formantBands = estimateFormantBands(chan, audioBuf.sampleRate);
+      const cadenceWpm = estimateSyllableCadenceWpm(chan, audioBuf.sampleRate);
       const quality = analyzeAudioSamplesQuality(chan, audioBuf.sampleRate);
-      return { pitchHz, brightness, quality };
+      return {
+        pitchHz: pitchStats.medianHz,
+        pitchRangeHz: pitchStats.rangeHz,
+        brightness,
+        cadenceWpm,
+        formantBands,
+        quality,
+      };
     } finally {
       await ctx.close().catch(() => {});
     }
   } catch {
-    return { pitchHz: null, brightness: 58, quality: defaultQuality };
+    return {
+      pitchHz: null,
+      pitchRangeHz: null,
+      brightness: 58,
+      cadenceWpm: 140,
+      formantBands: defaultBands,
+      quality: defaultQuality,
+    };
   }
 }
 
@@ -112,7 +145,14 @@ export async function trainAndTranscribeUserVoice(params: {
   sourceType?: VoiceProvenanceType;
   consentVerified?: boolean;
   measuredPitchHz?: number | null;
+  measuredPitchRangeHz?: number | null;
   measuredBrightness?: number;
+  measuredWpm?: number;
+  formantBands?: FormantBandProfile;
+  vocalRegister?: VocalRegister;
+  accent?: VoiceAccent;
+  speakingPace?: SpeakingPace;
+  passageIndex?: number;
   transcriptHint?: string;
   patientName?: string;
   existingProfile?: VoicePersonaData | null;
@@ -140,13 +180,21 @@ export async function trainAndTranscribeUserVoice(params: {
     body: JSON.stringify({
       audio_base64: isRealAudio ? params.audioBase64 : undefined,
       mime_type: params.mimeType,
+      source_kind: effectiveSource,
       source_type: effectiveSource,
       consent_verified: params.consentVerified ?? true,
       transcript_hint: params.transcriptHint,
       patient_name: params.patientName || 'Member',
       sample_count: nextSamples,
       measured_pitch_hz: isRealAudio ? params.measuredPitchHz ?? undefined : undefined,
+      measured_pitch_range_hz: isRealAudio ? params.measuredPitchRangeHz ?? undefined : undefined,
       measured_brightness: isRealAudio ? params.measuredBrightness : undefined,
+      measured_wpm: isRealAudio ? params.measuredWpm : undefined,
+      formant_bands: isRealAudio ? params.formantBands : undefined,
+      vocal_register: params.vocalRegister ?? params.existingProfile?.vocal_register,
+      accent: params.accent ?? params.existingProfile?.accent,
+      speaking_pace: params.speakingPace ?? params.existingProfile?.speaking_pace,
+      passage_index: params.passageIndex,
       existing_profile: params.existingProfile || undefined,
     }),
   });
@@ -186,6 +234,53 @@ export async function requestMatchedVoiceSynthesis(params: {
   };
 }
 
+/**
+ * Builds a 3-band WebAudio BiquadFilterNode formant/timbre shaping chain calibrated to
+ * the speaker's measured formant_bands, warmth, and brightness so Twin speech carries
+ * the speaker's chest resonance, vowel presence, and air.
+ */
+function connectSpeakerTimbreChain(
+  ctx: AudioContext,
+  inputNode: AudioNode,
+  destination: AudioNode,
+  profile?: VoicePersonaData | null
+): void {
+  if (!profile) {
+    inputNode.connect(destination);
+    return;
+  }
+  const bands = profile.formant_bands;
+  const warmth = profile.warmth ?? 85;
+  const brightness = profile.brightness ?? 58;
+
+  const lowShelf = ctx.createBiquadFilter();
+  lowShelf.type = 'lowshelf';
+  lowShelf.frequency.value = 230;
+  lowShelf.gain.value = bands
+    ? Math.max(-4.5, Math.min(5.5, (bands.low - 58) * 0.14 + (warmth - 80) * 0.08))
+    : Math.max(-3, Math.min(4, (warmth - 80) * 0.12));
+
+  const midPresence = ctx.createBiquadFilter();
+  midPresence.type = 'peaking';
+  midPresence.frequency.value = 1550;
+  midPresence.Q.value = 1.05;
+  midPresence.gain.value = bands
+    ? Math.max(-3.5, Math.min(4.5, (bands.presence - 60) * 0.12))
+    : 0.8;
+
+  const airShelf = ctx.createBiquadFilter();
+  airShelf.type = 'highshelf';
+  airShelf.frequency.value = 3900;
+  airShelf.gain.value = bands
+    ? Math.max(-4, Math.min(4.5, (bands.air - 52) * 0.11 + (brightness - 58) * 0.06))
+    : Math.max(-3, Math.min(3.5, (brightness - 58) * 0.09));
+
+  inputNode.connect(lowShelf);
+  lowShelf.connect(midPresence);
+  midPresence.connect(airShelf);
+  airShelf.connect(destination);
+}
+
 let activePlaybackCleanup: (() => void) | null = null;
 
 export function stopActiveVoicePlayback(): void {
@@ -210,8 +305,8 @@ export interface VoicePlaybackCallbacks {
 
 /**
  * Plays synthesized WAV audio matched to the user's voice profile using Web Audio
- * BufferSource + AnalyserNode (feeding live 0..1 lip-sync levels!) with graceful
- * HTMLAudioElement and SpeechSynthesis fallbacks.
+ * BufferSource + 3-band Formant EQ + AnalyserNode (feeding live 0..1 lip-sync levels!)
+ * with graceful HTMLAudioElement and SpeechSynthesis fallbacks.
  */
 export async function playMatchedVoiceReply(
   wavBase64: string | null | undefined,
@@ -227,7 +322,7 @@ export async function playMatchedVoiceReply(
   );
 
   if (wavBase64) {
-    // 1. Primary path: Web Audio API decodeAudioData + BufferSource + AnalyserNode
+    // 1. Primary path: Web Audio API decodeAudioData + BufferSource + Formant EQ + AnalyserNode
     try {
       const AudioCtx =
         window.AudioContext ||
@@ -242,7 +337,7 @@ export async function playMatchedVoiceReply(
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
         if (voiceProfile?.cadence_wpm) {
-          src.playbackRate.value = Math.max(0.88, Math.min(1.16, voiceProfile.cadence_wpm / 142));
+          src.playbackRate.value = Math.max(0.88, Math.min(1.15, voiceProfile.cadence_wpm / 142));
         }
 
         const analyser = ctx.createAnalyser();
@@ -250,7 +345,7 @@ export async function playMatchedVoiceReply(
         analyser.smoothingTimeConstant = 0.62;
         const bins = new Uint8Array(analyser.frequencyBinCount);
 
-        src.connect(analyser);
+        connectSpeakerTimbreChain(ctx, src, analyser, voiceProfile);
         analyser.connect(ctx.destination);
 
         let raf = 0;
@@ -287,7 +382,6 @@ export async function playMatchedVoiceReply(
         src.start(0);
         meterLoop();
 
-        // Safety timer in case headless AudioContext remains suspended
         const safetyMs = Math.ceil((audioBuf.duration / src.playbackRate.value) * 1000) + 450;
         window.setTimeout(finish, safetyMs);
         return;
@@ -300,7 +394,7 @@ export async function playMatchedVoiceReply(
     try {
       const audio = new Audio(`data:audio/wav;base64,${wavBase64}`);
       if (voiceProfile?.cadence_wpm) {
-        audio.playbackRate = Math.max(0.88, Math.min(1.16, voiceProfile.cadence_wpm / 142));
+        audio.playbackRate = Math.max(0.88, Math.min(1.15, voiceProfile.cadence_wpm / 142));
       }
       let finished = false;
       const done = () => {
@@ -353,7 +447,10 @@ export async function playMatchedVoiceReply(
 }
 
 export interface LiveVoiceSessionCallbacks {
-  onStatusChange?: (status: 'connecting' | 'listening' | 'speaking' | 'closed' | 'error', detail?: string) => void;
+  onStatusChange?: (
+    status: 'connecting' | 'listening' | 'speaking' | 'closed' | 'error',
+    detail?: string
+  ) => void;
   onInputTranscript?: (text: string) => void;
   onOutputTranscript?: (text: string) => void;
   onTurnComplete?: () => void;
@@ -362,18 +459,21 @@ export interface LiveVoiceSessionCallbacks {
 /**
  * Real-time bidirectional voice streaming client over /v1/live (Gemini 3.8 Live API).
  * Captures 16kHz mono PCM microphone audio and plays back 24kHz PCM Twin responses
- * gaplessly via scheduled AudioBufferSourceNodes + live AnalyserNode lip-sync metering.
+ * gaplessly through the speaker's calibrated formant EQ + live AnalyserNode lip-sync metering.
  */
 export class LiveTwinVoiceClient {
   private ws: WebSocket | null = null;
   private inputCtx: AudioContext | null = null;
   private outputCtx: AudioContext | null = null;
   private outputAnalyser: AnalyserNode | null = null;
+  private outputInputBus: GainNode | null = null;
   private outputBins: Uint8Array<ArrayBuffer> | null = null;
   private micStream: MediaStream | null = null;
   private processorNode: ScriptProcessorNode | null = null;
   private activeSources = new Set<AudioBufferSourceNode>();
   private nextStartTime = 0;
+  private voiceProfile: VoicePersonaData | null = null;
+  private nominalVoiceHz = 180;
   private callbacks: LiveVoiceSessionCallbacks;
 
   constructor(callbacks: LiveVoiceSessionCallbacks) {
@@ -391,6 +491,7 @@ export class LiveTwinVoiceClient {
 
   public async connect(params: {
     patientName: string;
+    patientSex?: string;
     bundle: any;
     voiceProfile?: VoicePersonaData | null;
     memories?: string[];
@@ -398,7 +499,8 @@ export class LiveTwinVoiceClient {
     enableMic?: boolean;
   }): Promise<void> {
     this.disconnect();
-    this.callbacks.onStatusChange?.('connecting', 'Connecting live Twin voice channel…');
+    this.voiceProfile = params.voiceProfile || null;
+    this.callbacks.onStatusChange?.('connecting', 'Connecting live voice…');
 
     const AudioCtx =
       window.AudioContext ||
@@ -409,9 +511,16 @@ export class LiveTwinVoiceClient {
       if (this.outputCtx.state === 'suspended') {
         await this.outputCtx.resume().catch(() => {});
       }
+      this.outputInputBus = this.outputCtx.createGain();
       this.outputAnalyser = this.outputCtx.createAnalyser();
       this.outputAnalyser.fftSize = 128;
       this.outputAnalyser.smoothingTimeConstant = 0.6;
+      connectSpeakerTimbreChain(
+        this.outputCtx,
+        this.outputInputBus,
+        this.outputAnalyser,
+        this.voiceProfile
+      );
       this.outputAnalyser.connect(this.outputCtx.destination);
       this.outputBins = new Uint8Array(new ArrayBuffer(this.outputAnalyser.frequencyBinCount));
     }
@@ -426,10 +535,19 @@ export class LiveTwinVoiceClient {
         ws.send(
           JSON.stringify({
             type: 'init',
+            patient_name: params.patientName,
             patientName: params.patientName,
+            patient_sex: params.patientSex || params.bundle?.patient?.sex,
             bundle: params.bundle,
+            voice_profile: params.voiceProfile || undefined,
             voiceProfile: params.voiceProfile || undefined,
-            memories: params.memories || [],
+            identity_memories: (params.memories || []).map((text, idx) => ({
+              id: `mem-${idx}`,
+              category: 'story',
+              text,
+              created_at: new Date().toISOString(),
+              source: 'user_written',
+            })),
           })
         );
       };
@@ -438,15 +556,24 @@ export class LiveTwinVoiceClient {
         try {
           const msg = JSON.parse(String(ev.data));
           if (msg.type === 'ready') {
+            const voiceName = msg.voice_used || msg.voice || 'Kore';
+            const nominalMap: Record<string, number> = {
+              Fenrir: 105,
+              Charon: 125,
+              Puck: 155,
+              Zephyr: 182,
+              Kore: 205,
+            };
+            this.nominalVoiceHz = nominalMap[voiceName] || 180;
             if (!settled) {
               settled = true;
               resolve();
             }
-            this.callbacks.onStatusChange?.('listening', `Connected (${msg.voice} voice)`);
+            this.callbacks.onStatusChange?.('listening', 'Listening… speak naturally');
             return;
           }
           if (msg.type === 'error') {
-            const errMsg = msg.error || 'Live voice session error';
+            const errMsg = msg.message || msg.error || 'Live voice session unavailable';
             this.callbacks.onStatusChange?.('error', errMsg);
             if (!settled) {
               settled = true;
@@ -454,20 +581,24 @@ export class LiveTwinVoiceClient {
             }
             return;
           }
-          if (msg.inputTranscript) {
+          if (msg.type === 'input_transcript' && msg.text) {
+            this.callbacks.onInputTranscript?.(msg.text);
+          } else if (msg.inputTranscript) {
             this.callbacks.onInputTranscript?.(msg.inputTranscript);
           }
-          if (msg.outputTranscript) {
+          if (msg.type === 'output_transcript' && msg.text) {
+            this.callbacks.onOutputTranscript?.(msg.text);
+          } else if (msg.outputTranscript) {
             this.callbacks.onOutputTranscript?.(msg.outputTranscript);
           }
           if (msg.audio) {
             this.enqueuePcm24kChunk(msg.audio);
           }
-          if (msg.interrupted) {
+          if (msg.type === 'interrupted' || msg.interrupted) {
             this.flushOutputQueue();
             this.callbacks.onStatusChange?.('listening', 'Listening…');
           }
-          if (msg.turnComplete) {
+          if (msg.type === 'turn_complete' || msg.turnComplete) {
             this.callbacks.onTurnComplete?.();
           }
         } catch {
@@ -513,13 +644,13 @@ export class LiveTwinVoiceClient {
       } catch {
         this.callbacks.onStatusChange?.(
           'listening',
-          'Live voice connected (mic unavailable — type prompts to hear real-time Twin speech).'
+          'Live voice connected — tap a spoken prompt below if microphone permission is off.'
         );
       }
     }
   }
 
-  public sendTextTurn(text: string): void {
+  public sendSpokenPromptTurn(text: string): void {
     const trimmed = text.trim();
     if (!trimmed || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ type: 'text', text: trimmed }));
@@ -540,7 +671,15 @@ export class LiveTwinVoiceClient {
 
     const src = this.outputCtx.createBufferSource();
     src.buffer = audioBuf;
-    src.connect(this.outputAnalyser);
+    let rate = 1;
+    if (this.voiceProfile?.pitch_hz && this.nominalVoiceHz > 0) {
+      rate = Math.max(
+        0.88,
+        Math.min(1.14, this.voiceProfile.pitch_hz / this.nominalVoiceHz)
+      );
+      src.playbackRate.value = rate;
+    }
+    src.connect(this.outputInputBus || this.outputAnalyser);
 
     const now = this.outputCtx.currentTime;
     if (this.nextStartTime < now + 0.015) {
@@ -548,7 +687,7 @@ export class LiveTwinVoiceClient {
     }
 
     this.activeSources.add(src);
-    this.callbacks.onStatusChange?.('speaking', 'Twin speaking live…');
+    this.callbacks.onStatusChange?.('speaking', 'Speaking in your voice…');
 
     src.onended = () => {
       this.activeSources.delete(src);
@@ -558,7 +697,7 @@ export class LiveTwinVoiceClient {
     };
 
     src.start(this.nextStartTime);
-    this.nextStartTime += audioBuf.duration;
+    this.nextStartTime += audioBuf.duration / rate;
   }
 
   private flushOutputQueue(): void {

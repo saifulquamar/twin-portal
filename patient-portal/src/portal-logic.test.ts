@@ -277,4 +277,33 @@ test('preserve-math: computeTwinCompleteness, buildSelfPerspectivePrompts, and a
   assert.equal(quality.qualityLabel, 'Studio Clear');
 });
 
+test('preserve-math: estimateFormantBands, estimateSyllableCadenceWpm, and inferRegisterFromPitchHz', async () => {
+  const {
+    estimateFormantBands,
+    estimateSyllableCadenceWpm,
+    inferRegisterFromPitchHz,
+  } = await import('./preserve-math');
 
+  assert.equal(inferRegisterFromPitchHz(110), 'deep');
+  assert.equal(inferRegisterFromPitchHz(148), 'warm_mid');
+  assert.equal(inferRegisterFromPitchHz(182), 'clear_mid');
+  assert.equal(inferRegisterFromPitchHz(220), 'bright_high');
+
+  const sr = 16000;
+  const signal = new Float32Array(sr * 2);
+  for (let i = 0; i < signal.length; i++) {
+    const t = i / sr;
+    const sylMod = Math.max(0, Math.sin(2 * Math.PI * 3.6 * t));
+    signal[i] =
+      sylMod *
+      (0.55 * Math.sin(2 * Math.PI * 150 * t) +
+        0.25 * Math.sin(2 * Math.PI * 1450 * t) +
+        0.08 * Math.sin(2 * Math.PI * 4200 * t));
+  }
+  const bands = estimateFormantBands(signal, sr);
+  assert.ok(bands.low >= 25 && bands.low <= 96);
+  assert.ok(bands.presence >= 25 && bands.presence <= 96);
+
+  const wpm = estimateSyllableCadenceWpm(signal, sr);
+  assert.ok(wpm >= 115 && wpm <= 170, `Expected natural conversational WPM, got ${wpm}`);
+});

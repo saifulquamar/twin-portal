@@ -1594,10 +1594,10 @@ Never invent facts not stated or shown. Resolve relative dates like "yesterday" 
   }
 
   async trainVoicePersona(params: VoiceTrainRequestBody): Promise<VoiceTrainResponse> {
-    // Strictly distinguish real audio bytes from text-only transcripts!
+    const sourceKind = params.source_kind ?? params.source_type;
     const hasRealAudio =
       Boolean(params.audio_base64 && params.audio_base64.trim().length > 32) &&
-      params.source_kind !== 'text_only';
+      sourceKind !== 'text_only';
 
     const prevAudioSamples =
       params.existing_profile?.audio_sample_count ??
@@ -1607,18 +1607,76 @@ Never invent facts not stated or shown. Resolve relative dates like "yesterday" 
       ? Math.max(prevAudioSamples + 1, params.sample_count ?? prevAudioSamples + 1)
       : prevAudioSamples;
 
-    const progressiveFidelity = hasRealAudio
-      ? Math.min(98, Math.round(48 + Math.min(nextCount, 6) * 8.5))
-      : params.existing_profile?.fidelity_score ?? 0;
+    const prevPassages = Array.isArray(params.existing_profile?.completed_passages)
+      ? params.existing_profile!.completed_passages!
+      : [];
+    const completedPassages =
+      hasRealAudio && typeof params.passage_index === 'number'
+        ? Array.from(new Set([...prevPassages, params.passage_index])).sort((a, b) => a - b)
+        : prevPassages;
 
-    const measuredPitch =
+    const registerNominalMap: Record<string, number> = {
+      deep: 112,
+      warm_mid: 146,
+      clear_mid: 180,
+      bright_high: 212,
+    };
+    const paceNominalWpmMap: Record<string, number> = {
+      calm: 122,
+      natural: 142,
+      brisk: 162,
+    };
+    const accentLabelMap: Record<string, string> = {
+      neutral: 'neutral international English',
+      indian_english: 'natural Indian English',
+      british: 'natural British English',
+      american: 'natural North American English',
+      european: 'natural Continental European English',
+      australian: 'natural Australian English',
+    };
+
+    const chosenRegister =
+      params.vocal_register ?? params.existing_profile?.vocal_register;
+    const chosenAccent = params.accent ?? params.existing_profile?.accent ?? 'neutral';
+    const chosenPace =
+      params.speaking_pace ?? params.existing_profile?.speaking_pace ?? 'natural';
+
+    const rawNewPitch =
       hasRealAudio &&
       typeof params.measured_pitch_hz === 'number' &&
       Number.isFinite(params.measured_pitch_hz) &&
       params.measured_pitch_hz >= 70 &&
       params.measured_pitch_hz <= 340
         ? Math.round(params.measured_pitch_hz)
-        : params.existing_profile?.pitch_hz;
+        : null;
+
+    // Multi-sample weighted F0 stabilization so 2-3 samples lock onto true speaker F0
+    const prevPitch = params.existing_profile?.pitch_hz;
+    const measuredPitch =
+      rawNewPitch != null && prevPitch != null && prevAudioSamples > 0
+        ? Math.round((prevPitch * Math.min(prevAudioSamples, 3) + rawNewPitch) / (Math.min(prevAudioSamples, 3) + 1))
+        : rawNewPitch ??
+          prevPitch ??
+          (chosenRegister ? registerNominalMap[chosenRegister] : undefined);
+
+    const effectiveRegister: VoicePersonaProfile['vocal_register'] =
+      chosenRegister ||
+      (measuredPitch
+        ? measuredPitch < 126
+          ? 'deep'
+          : measuredPitch < 164
+            ? 'warm_mid'
+            : measuredPitch < 198
+              ? 'clear_mid'
+              : 'bright_high'
+        : 'clear_mid');
+
+    const measuredPitchRange =
+      hasRealAudio &&
+      typeof params.measured_pitch_range_hz === 'number' &&
+      Number.isFinite(params.measured_pitch_range_hz)
+        ? Math.round(params.measured_pitch_range_hz)
+        : params.existing_profile?.pitch_range_hz ?? 24;
 
     const measuredBrightness =
       hasRealAudio &&
@@ -1627,8 +1685,38 @@ Never invent facts not stated or shown. Resolve relative dates like "yesterday" 
         ? Math.round(params.measured_brightness)
         : params.existing_profile?.brightness;
 
+    // Blend formant bands across approved recordings
+    const prevBands = params.existing_profile?.formant_bands;
+    const newBands = hasRealAudio ? params.formant_bands : undefined;
+    const mergedBands =
+      newBands && prevBands && prevAudioSamples > 0
+        ? {
+            low: Math.round((prevBands.low * prevAudioSamples + newBands.low) / (prevAudioSamples + 1)),
+            mid: Math.round((prevBands.mid * prevAudioSamples + newBands.mid) / (prevAudioSamples + 1)),
+            presence: Math.round(
+              (prevBands.presence * prevAudioSamples + newBands.presence) / (prevAudioSamples + 1)
+            ),
+            air: Math.round((prevBands.air * prevAudioSamples + newBands.air) / (prevAudioSamples + 1)),
+          }
+        : newBands ?? prevBands;
+
+    const basePaceWpm = paceNominalWpmMap[chosenPace] || 142;
+    const measuredWpm =
+      hasRealAudio &&
+      typeof params.measured_wpm === 'number' &&
+      Number.isFinite(params.measured_wpm)
+        ? Math.round(params.measured_wpm * 0.65 + basePaceWpm * 0.35)
+        : params.existing_profile?.cadence_wpm || basePaceWpm;
+
+    // Fidelity reflects phonetic coverage (1 sample ~66%, 2 samples ~82%, 3+ samples ~94-98%)
+    const passageBonus = completedPassages.length * 4;
+    const metadataBonus = (chosenRegister ? 3 : 0) + (chosenAccent ? 2 : 0);
+    const progressiveFidelity = hasRealAudio
+      ? Math.min(98, Math.round(52 + Math.min(nextCount, 4) * 9.5 + passageBonus + metadataBonus))
+      : params.existing_profile?.fidelity_score ?? 0;
+
     const pitchMatchedVoice = selectClosestPrebuiltVoiceByPitch(
-      measuredPitch,
+      measuredPitch ?? registerNominalMap[effectiveRegister || 'clear_mid'],
       params.existing_profile?.prebuilt_voice || 'Kore'
     );
 
@@ -1662,6 +1750,15 @@ Never invent facts not stated or shown. Resolve relative dates like "yesterday" 
         'Hi, this is my own voice preserved for my Mutanex Digital Twin—calm, clear, and grounded in who I am.';
     }
 
+    const accentDesc = accentLabelMap[chosenAccent] || chosenAccent;
+    const deterministicStyle = `${accentDesc} speaker in a ${effectiveRegister?.replace('_', ' ')} vocal register (~${
+      measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]
+    } Hz, ±${measuredPitchRange} Hz pitch dynamics) at a ${chosenPace} ${measuredWpm} wpm cadence${
+      mergedBands
+        ? `, chest resonance ${mergedBands.low}/100, vocal presence ${mergedBands.presence}/100`
+        : ''
+    }`;
+
     if (this.ai && hasRealAudio) {
       try {
         const parts: any[] = [];
@@ -1674,19 +1771,24 @@ Never invent facts not stated or shown. Resolve relative dates like "yesterday" 
           });
         }
         parts.push({
-          text: `Analyze this speaker's exact vocal acoustics, accent, pitch register (${
-            measuredPitch ? `measured F0 = ${measuredPitch} Hz` : 'infer from audio'
-          }), cadence, and intonation so Gemini 3.8 TTS Voice Design can speak back in the SAME voice as this speaker (${
-            params.patient_name || 'the user'
-          }).
-Transcript: "${transcript}"
-Closest acoustic base voice by F0: ${pitchMatchedVoice}
-Previous profile: ${JSON.stringify(params.existing_profile || {})}
-Approved audio sample #${nextCount}.
+          text: `Analyze this speaker's exact vocal acoustics so Gemini 3.8 Flash TTS Voice Design can speak back in the SAME personal voice as ${
+            params.patient_name || 'the speaker'
+          }.
+Measured speaker parameters:
+- Fundamental pitch F0: ${measuredPitch ? `${measuredPitch} Hz (±${measuredPitchRange} Hz)` : 'infer from audio'}
+- Declared/detected register: ${effectiveRegister}
+- Accent / dialect: ${accentDesc}
+- Speaking pace: ${chosenPace} (~${measuredWpm} wpm)
+- 4-band formant energy: ${JSON.stringify(mergedBands || {})}
+- Transcript: "${transcript}"
+- Closest acoustic base voice by F0: ${pitchMatchedVoice}
+- Approved audio sample #${nextCount} (calibrated passages: ${completedPassages.length}/3)
+- Previous profile: ${JSON.stringify(params.existing_profile || {})}
+
 Return JSON with:
-- vocal_style: rich TTS Voice Design description capturing the speaker's exact register, accent/inflection, breathiness, pacing, and warmth
+- vocal_style: rich, specific Voice Design direction capturing this person's exact register, ${accentDesc} inflection, vowel warmth, breathiness, and ${chosenPace} cadence
 - prebuilt_voice: best matching Gemini voice ("Fenrir" ~105Hz deep, "Charon" ~125Hz warm baritone, "Puck" ~155Hz midrange, "Zephyr" ~182Hz bright mezzo, "Kore" ~205Hz clear alto/soprano)
-- cadence_wpm (105-170), warmth (0-100), clarity (0-100), signature_phrases (up to 4), and summary.`,
+- cadence_wpm (105-175), warmth (0-100), clarity (0-100), signature_phrases (up to 4), and summary.`,
         });
 
         const res = await this.ai.models.generateContent({
@@ -1730,9 +1832,10 @@ Return JSON with:
           let pb: VoicePersonaProfile['prebuilt_voice'] = validVoices.includes(parsed.prebuilt_voice)
             ? parsed.prebuilt_voice
             : pitchMatchedVoice;
-          if (measuredPitch) {
+          const refHz = measuredPitch ?? registerNominalMap[effectiveRegister || 'clear_mid'];
+          if (refHz) {
             const llmHz = VOICE_NOMINAL_PITCH_HZ[pb];
-            if (Math.abs(measuredPitch - llmHz) > 45) {
+            if (Math.abs(refHz - llmHz) > 38) {
               pb = pitchMatchedVoice;
             }
           }
@@ -1740,25 +1843,37 @@ Return JSON with:
             transcript,
             used_real_audio: true,
             profile: {
-              vocal_style: String(parsed.vocal_style),
+              vocal_style: `${String(parsed.vocal_style)} (${accentDesc}, ~${
+                measuredPitch || VOICE_NOMINAL_PITCH_HZ[pb]
+              } Hz)`,
               prebuilt_voice: pb,
-              cadence_wpm: Math.max(95, Math.min(180, Math.round(Number(parsed.cadence_wpm) || 136))),
-              warmth: Math.max(50, Math.min(100, Math.round(Number(parsed.warmth) || 88))),
-              clarity: Math.max(60, Math.min(100, Math.round(Number(parsed.clarity) || 91))),
+              cadence_wpm: Math.max(
+                98,
+                Math.min(176, Math.round((Number(parsed.cadence_wpm) || measuredWpm) * 0.5 + measuredWpm * 0.5))
+              ),
+              warmth: Math.max(50, Math.min(100, Math.round(Number(parsed.warmth) || (mergedBands?.low ?? 86)))),
+              clarity: Math.max(60, Math.min(100, Math.round(Number(parsed.clarity) || (mergedBands?.presence ?? 90)))),
               pitch_hz: measuredPitch ?? VOICE_NOMINAL_PITCH_HZ[pb],
+              pitch_range_hz: measuredPitchRange,
               brightness: measuredBrightness ?? 58,
+              vocal_register: effectiveRegister,
+              accent: chosenAccent,
+              speaking_pace: chosenPace,
+              formant_bands: mergedBands,
+              completed_passages: completedPassages,
               signature_phrases: Array.isArray(parsed.signature_phrases)
                 ? parsed.signature_phrases.slice(0, 4).map(String)
                 : ['Take one steady step at a time'],
               sample_count: nextCount,
               audio_sample_count: nextCount,
+              used_real_audio: true,
               fidelity_score: progressiveFidelity,
               consent_verified: Boolean(params.consent_verified ?? true),
               allow_conversation_refinement: Boolean(params.allow_conversation_refinement),
               encrypted_at_rest: true,
               summary: String(
                 parsed.summary ||
-                  'Vocal pitch, cadence, and timbre locked from your spoken audio.'
+                  `Calibrated ${pb} (${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pb]} Hz · ${accentDesc}) from ${nextCount} voice sample${nextCount === 1 ? '' : 's'}.`
               ),
             },
           };
@@ -1772,28 +1887,35 @@ Return JSON with:
       transcript,
       used_real_audio: hasRealAudio,
       profile: {
-        vocal_style:
-          params.existing_profile?.vocal_style ||
-          `Natural conversational voice at ~${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]} Hz with warm articulation and steady pacing`,
+        vocal_style: params.existing_profile?.vocal_style || deterministicStyle,
         prebuilt_voice: pitchMatchedVoice,
-        cadence_wpm: params.existing_profile?.cadence_wpm || 136,
-        warmth: params.existing_profile?.warmth || 89,
-        clarity: params.existing_profile?.clarity || 92,
+        cadence_wpm: measuredWpm,
+        warmth: mergedBands ? Math.min(96, Math.max(55, mergedBands.low + 18)) : params.existing_profile?.warmth || 88,
+        clarity: mergedBands
+          ? Math.min(97, Math.max(62, mergedBands.presence + 22))
+          : params.existing_profile?.clarity || 91,
         pitch_hz: measuredPitch ?? VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice],
+        pitch_range_hz: measuredPitchRange,
         brightness: measuredBrightness ?? 58,
+        vocal_register: effectiveRegister,
+        accent: chosenAccent,
+        speaking_pace: chosenPace,
+        formant_bands: mergedBands,
+        completed_passages: completedPassages,
         signature_phrases: [
           ...(params.existing_profile?.signature_phrases || []),
           transcript.split(/[.,!?]/)[0]?.slice(0, 48) || 'Steady warmth and care',
         ].slice(-4),
         sample_count: nextCount,
         audio_sample_count: nextCount,
+        used_real_audio: hasRealAudio || Boolean(params.existing_profile?.used_real_audio),
         fidelity_score: progressiveFidelity,
         consent_verified: Boolean(params.consent_verified ?? true),
         allow_conversation_refinement: Boolean(params.allow_conversation_refinement),
         encrypted_at_rest: true,
         summary: hasRealAudio
-          ? `Matched to ${pitchMatchedVoice} (${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]} Hz) from ${nextCount} approved audio recording${nextCount === 1 ? '' : 's'}.`
-          : 'Transcript logged without modifying acoustic voice model (real audio required for voice training).',
+          ? `Calibrated ${pitchMatchedVoice} (${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]} Hz · ${accentDesc}) from ${nextCount} voice sample${nextCount === 1 ? '' : 's'}.`
+          : 'Transcript logged without modifying acoustic voice model.',
       },
     };
   }
@@ -1809,16 +1931,21 @@ Return JSON with:
     const validVoices = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
     const defaultBySex: VoicePersonaProfile['prebuilt_voice'] =
       params.patient_sex?.toLowerCase() === 'male' ? 'Charon' : 'Kore';
-    const targetPitch = params.voice_profile?.pitch_hz;
+    const vp = params.voice_profile;
+    const targetPitch = vp?.pitch_hz;
     const chosenVoice: VoicePersonaProfile['prebuilt_voice'] =
-      params.voice_profile?.prebuilt_voice &&
-      validVoices.includes(params.voice_profile.prebuilt_voice)
-        ? params.voice_profile.prebuilt_voice
+      vp?.prebuilt_voice && validVoices.includes(vp.prebuilt_voice)
+        ? vp.prebuilt_voice
         : selectClosestPrebuiltVoiceByPitch(targetPitch, defaultBySex);
 
+    const accentNote =
+      vp?.accent && vp.accent !== 'neutral'
+        ? `, ${vp.accent.replace('_', ' ')} inflection`
+        : '';
+    const paceNote = vp?.speaking_pace ? `, ${vp.speaking_pace} pace (~${vp.cadence_wpm || 140} wpm)` : '';
     const stylePrompt =
-      params.voice_profile?.vocal_style ||
-      'Warm, natural conversational tone matching the speaker’s own calm cadence and clarity';
+      vp?.vocal_style ||
+      `Warm, natural first-person conversational voice${accentNote}${paceNote}`;
     const resolvedPitch = targetPitch || VOICE_NOMINAL_PITCH_HZ[chosenVoice];
 
     const ttsClient = this.aiBeta || this.ai;
@@ -1831,10 +1958,14 @@ Return JSON with:
       };
     }
 
-    // Use v1beta endpoint without unsupported speechMetadata fields so speechConfig succeeds cleanly
-    const directedPrompt = `Speak the following message naturally in a ${stylePrompt}: "${cleanText}"`;
+    const directedPrompt = `Speak the following first-person reflection naturally in this exact personal voice (${stylePrompt}): "${cleanText}"`;
 
-    for (const ttsModel of ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']) {
+    // Prioritize flagship gemini-3.8-flash-tts when a calibrated personal voice profile is active
+    const modelOrder = vp?.sample_count
+      ? ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts']
+      : ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+
+    for (const ttsModel of modelOrder) {
       try {
         const ttsRes = await ttsClient.models.generateContent({
           model: ttsModel,
@@ -1862,7 +1993,7 @@ Return JSON with:
             validWav,
             chosenVoice,
             targetPitch,
-            params.voice_profile?.warmth ?? 86
+            vp?.warmth ?? 86
           );
           return {
             audio_wav_base64: matchedWav,

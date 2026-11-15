@@ -160,6 +160,13 @@ export interface VoiceRecordingClipMeta {
   audio_data_url?: string;
 }
 
+export interface FormantBandProfile {
+  low: number;
+  mid: number;
+  presence: number;
+  air: number;
+}
+
 export interface VoicePersonaProfile {
   vocal_style: string;
   prebuilt_voice: 'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr';
@@ -167,7 +174,13 @@ export interface VoicePersonaProfile {
   warmth: number;
   clarity: number;
   pitch_hz?: number;
+  pitch_range_hz?: number;
   brightness?: number;
+  vocal_register?: 'deep' | 'warm_mid' | 'clear_mid' | 'bright_high';
+  accent?: string;
+  speaking_pace?: 'calm' | 'natural' | 'brisk';
+  formant_bands?: FormantBandProfile;
+  completed_passages?: number[];
   signature_phrases: string[];
   sample_count: number;
   fidelity_score: number;
@@ -176,19 +189,28 @@ export interface VoicePersonaProfile {
   consent_verified?: boolean;
   allow_conversation_refinement?: boolean;
   audio_sample_count?: number;
+  used_real_audio?: boolean;
 }
 
 export interface VoiceTrainRequestBody {
   audio_base64?: string;
   mime_type?: string;
   source_kind?: VoiceAudioSourceKind;
+  source_type?: VoiceAudioSourceKind;
   consent_verified?: boolean;
   allow_conversation_refinement?: boolean;
   transcript_hint?: string;
   patient_name?: string;
   sample_count?: number;
   measured_pitch_hz?: number;
+  measured_pitch_range_hz?: number;
   measured_brightness?: number;
+  measured_wpm?: number;
+  formant_bands?: FormantBandProfile;
+  vocal_register?: 'deep' | 'warm_mid' | 'clear_mid' | 'bright_high';
+  accent?: string;
+  speaking_pace?: 'calm' | 'natural' | 'brisk';
+  passage_index?: number;
   existing_profile?: Partial<VoicePersonaProfile>;
 }
 

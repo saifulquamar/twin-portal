@@ -4,6 +4,25 @@ export type VoiceProvenanceType =
   | 'conversation_audio'
   | 'text_only';
 
+export type VocalRegister = 'deep' | 'warm_mid' | 'clear_mid' | 'bright_high';
+
+export type VoiceAccent =
+  | 'neutral'
+  | 'indian_english'
+  | 'british'
+  | 'american'
+  | 'european'
+  | 'australian';
+
+export type SpeakingPace = 'calm' | 'natural' | 'brisk';
+
+export interface FormantBandProfile {
+  low: number; // 80-320 Hz chest resonance (0..100)
+  mid: number; // 320-1200 Hz vowel body (0..100)
+  presence: number; // 1200-3400 Hz clarity/articulation (0..100)
+  air: number; // 3400-7500 Hz breath/brilliance (0..100)
+}
+
 export interface VoicePersonaData {
   vocal_style: string;
   prebuilt_voice: 'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr';
@@ -11,10 +30,16 @@ export interface VoicePersonaData {
   warmth: number;
   clarity: number;
   pitch_hz?: number;
+  pitch_range_hz?: number;
   brightness?: number;
+  vocal_register?: VocalRegister;
+  accent?: VoiceAccent;
+  speaking_pace?: SpeakingPace;
+  formant_bands?: FormantBandProfile;
   signature_phrases: string[];
   sample_count: number;
   audio_sample_count?: number;
+  completed_passages?: number[];
   fidelity_score: number;
   summary: string;
   consent_verified?: boolean;
@@ -79,6 +104,62 @@ export interface AudioQualityReport {
 
 function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
+}
+
+export const VOCAL_REGISTER_LABELS: Record<VocalRegister, string> = {
+  deep: 'Deep (85–130 Hz)',
+  warm_mid: 'Warm Mid (125–165 Hz)',
+  clear_mid: 'Clear Mid (160–200 Hz)',
+  bright_high: 'Bright (195–255 Hz)',
+};
+
+export const VOICE_ACCENT_LABELS: Record<VoiceAccent, string> = {
+  neutral: 'Neutral International',
+  indian_english: 'Indian English',
+  british: 'British',
+  american: 'North American',
+  european: 'Continental European',
+  australian: 'Australian / NZ',
+};
+
+export const SPEAKING_PACE_LABELS: Record<SpeakingPace, string> = {
+  calm: 'Calm (~122 wpm)',
+  natural: 'Natural (~142 wpm)',
+  brisk: 'Brisk (~162 wpm)',
+};
+
+export function inferRegisterFromPitchHz(pitchHz?: number | null): VocalRegister {
+  if (!pitchHz || !Number.isFinite(pitchHz)) return 'clear_mid';
+  if (pitchHz < 126) return 'deep';
+  if (pitchHz < 164) return 'warm_mid';
+  if (pitchHz < 198) return 'clear_mid';
+  return 'bright_high';
+}
+
+export function nominalPitchForRegister(reg?: VocalRegister): number {
+  switch (reg) {
+    case 'deep':
+      return 112;
+    case 'warm_mid':
+      return 146;
+    case 'bright_high':
+      return 212;
+    case 'clear_mid':
+    default:
+      return 180;
+  }
+}
+
+export function nominalWpmForPace(pace?: SpeakingPace): number {
+  switch (pace) {
+    case 'calm':
+      return 122;
+    case 'brisk':
+      return 162;
+    case 'natural':
+    default:
+      return 142;
+  }
 }
 
 /**
@@ -293,8 +374,8 @@ export function analyzeAudioSamplesQuality(
 }
 
 /**
- * Generates a valid 16kHz 16-bit mono PCM WAV base64 payload (0.8s warm speech-band
- * harmonic envelope) so sample voice calibration works cleanly in headless or mic-less environments.
+ * Generates a valid 16kHz 16-bit mono PCM WAV base64 payload (warm speech-band
+ * harmonic envelope) so sample calibration works cleanly in mic-less environments.
  */
 export function createSampleVoiceWavBase64(durationSec = 0.85, baseF0 = 182): string {
   const sampleRate = 16000;
@@ -359,26 +440,26 @@ export function computeSyntheticSpeechMouthOpen(elapsedSec: number, wpm = 148): 
 }
 
 /**
- * Estimates the speaker's fundamental vocal pitch F0 (Hz) from PCM samples
- * using normalized time-domain autocorrelation across human voiced range (75..310 Hz).
+ * Estimates the speaker's fundamental vocal pitch F0 (Hz) and pitch range
+ * from PCM samples using normalized autocorrelation across human voiced range (75..310 Hz).
  */
-export function estimateAutocorrelationPitchHz(
+export function estimateAutocorrelationPitchStats(
   samples: Float32Array,
   sampleRate: number
-): number | null {
+): { medianHz: number | null; rangeHz: number | null } {
   if (!samples || samples.length < 1024 || sampleRate < 4000) {
-    return null;
+    return { medianHz: null, rangeHz: null };
   }
 
   const minLag = Math.max(8, Math.floor(sampleRate / 310));
   const maxLag = Math.min(samples.length >> 1, Math.ceil(sampleRate / 75));
-  if (maxLag <= minLag) return null;
+  if (maxLag <= minLag) return { medianHz: null, rangeHz: null };
 
   const frameSize = Math.min(2048, samples.length - maxLag - 1);
-  if (frameSize < 512) return null;
+  if (frameSize < 512) return { medianHz: null, rangeHz: null };
 
   const detectedF0s: number[] = [];
-  const step = Math.max(512, Math.floor(samples.length / 8));
+  const step = Math.max(512, Math.floor(samples.length / 10));
 
   for (let offset = 0; offset + frameSize + maxLag < samples.length; offset += step) {
     let rms = 0;
@@ -416,9 +497,20 @@ export function estimateAutocorrelationPitchHz(
     }
   }
 
-  if (detectedF0s.length === 0) return null;
+  if (detectedF0s.length === 0) return { medianHz: null, rangeHz: null };
   detectedF0s.sort((a, b) => a - b);
-  return Math.round(detectedF0s[Math.floor(detectedF0s.length / 2)]);
+  const medianHz = Math.round(detectedF0s[Math.floor(detectedF0s.length / 2)]);
+  const p15 = detectedF0s[Math.floor(detectedF0s.length * 0.15)];
+  const p85 = detectedF0s[Math.min(detectedF0s.length - 1, Math.floor(detectedF0s.length * 0.85))];
+  const rangeHz = Math.max(8, Math.round(p85 - p15));
+  return { medianHz, rangeHz };
+}
+
+export function estimateAutocorrelationPitchHz(
+  samples: Float32Array,
+  sampleRate: number
+): number | null {
+  return estimateAutocorrelationPitchStats(samples, sampleRate).medianHz;
 }
 
 /**
@@ -441,4 +533,114 @@ export function estimateSpectralBrightness(
   const zcrHz = (crossings / samples.length) * (sampleRate / 2);
   const normalized = Math.round(35 + Math.min(60, (zcrHz / 1600) * 55));
   return Math.max(25, Math.min(95, normalized));
+}
+
+/**
+ * Estimates a 4-band vocal formant/timbre envelope (low chest, vowel mid, presence, air)
+ * using lightweight single-pole cascaded IIR band splits on voiced frames.
+ */
+export function estimateFormantBands(
+  samples: Float32Array,
+  sampleRate = 16000
+): FormantBandProfile {
+  if (!samples || samples.length < 512 || sampleRate <= 0) {
+    return { low: 62, mid: 68, presence: 64, air: 52 };
+  }
+  const a320 = Math.exp((-2 * Math.PI * 320) / sampleRate);
+  const a1200 = Math.exp((-2 * Math.PI * 1200) / sampleRate);
+  const a3400 = Math.exp((-2 * Math.PI * 3400) / sampleRate);
+
+  let lp320 = 0;
+  let lp1200 = 0;
+  let lp3400 = 0;
+
+  let eLow = 0;
+  let eMid = 0;
+  let ePres = 0;
+  let eAir = 0;
+
+  const stride = samples.length > 64000 ? 2 : 1;
+  for (let i = 0; i < samples.length; i += stride) {
+    const x = samples[i];
+    lp320 = (1 - a320) * x + a320 * lp320;
+    lp1200 = (1 - a1200) * x + a1200 * lp1200;
+    lp3400 = (1 - a3400) * x + a3400 * lp3400;
+
+    const bLow = lp320;
+    const bMid = lp1200 - lp320;
+    const bPres = lp3400 - lp1200;
+    const bAir = x - lp3400;
+
+    eLow += bLow * bLow;
+    eMid += bMid * bMid;
+    ePres += bPres * bPres;
+    eAir += bAir * bAir;
+  }
+
+  const total = Math.max(1e-9, eLow + eMid + ePres + eAir);
+  const norm = (v: number, scale: number, base: number) =>
+    clamp(Math.round(base + Math.sqrt(v / total) * scale), 25, 96);
+
+  return {
+    low: norm(eLow, 72, 28),
+    mid: norm(eMid, 68, 32),
+    presence: norm(ePres, 85, 30),
+    air: norm(eAir, 95, 26),
+  };
+}
+
+/**
+ * Estimates natural speaking cadence (words per minute) from syllable energy peaks
+ * across voiced segments.
+ */
+export function estimateSyllableCadenceWpm(
+  samples: Float32Array,
+  sampleRate = 16000
+): number {
+  if (!samples || samples.length < Math.floor(sampleRate * 0.6) || sampleRate <= 0) {
+    return 140;
+  }
+  const win = Math.max(160, Math.floor(sampleRate * 0.04)); // 40ms envelope frames
+  const env: number[] = [];
+  for (let i = 0; i < samples.length; i += win) {
+    const end = Math.min(samples.length, i + win);
+    let sq = 0;
+    for (let j = i; j < end; j++) sq += samples[j] * samples[j];
+    env.push(Math.sqrt(sq / Math.max(1, end - i)));
+  }
+  const maxEnv = Math.max(...env, 0.001);
+  const thresh = Math.max(0.014, maxEnv * 0.28);
+
+  let activeSpeechFrames = 0;
+  let silenceRun = 999;
+  const maxConsonantDipFrames = 8; // 8 * 40ms = 320ms inter-syllable gap bridged
+  let peaks = 0;
+  let lastPeakIdx = -4;
+
+  for (let i = 0; i < env.length; i++) {
+    if (env[i] >= thresh * 0.45) {
+      if (silenceRun > 0 && silenceRun <= maxConsonantDipFrames) {
+        activeSpeechFrames += silenceRun;
+      }
+      activeSpeechFrames++;
+      silenceRun = 0;
+    } else {
+      silenceRun++;
+    }
+    if (
+      i > 0 &&
+      i < env.length - 1 &&
+      env[i] > thresh &&
+      env[i] >= env[i - 1] &&
+      env[i] >= env[i + 1] &&
+      i - lastPeakIdx >= 3
+    ) {
+      peaks++;
+      lastPeakIdx = i;
+    }
+  }
+  const speechSec = Math.max(0.5, (activeSpeechFrames * win) / sampleRate);
+  const syllablesPerSec = clamp(peaks / speechSec, 2.4, 5.6);
+  // English / conversational average ~1.48 syllables per word
+  return clamp(Math.round((syllablesPerSec / 1.48) * 60), 108, 178);
 }

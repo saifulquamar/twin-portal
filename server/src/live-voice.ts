@@ -12,10 +12,13 @@ interface LiveInitPayload {
   type: 'init';
   patient_id?: string;
   patient_name?: string;
+  patientName?: string;
   patient_sex?: string;
   bundle?: any;
   voice_profile?: Partial<VoicePersonaProfile> | null;
+  voiceProfile?: Partial<VoicePersonaProfile> | null;
   identity_memories?: IdentityMemoryItem[];
+  memories?: Array<string | IdentityMemoryItem>;
 }
 
 export function attachLiveVoiceWebSocket(
@@ -54,37 +57,53 @@ export function attachLiveVoiceWebSocket(
         return;
       }
 
+      const vp = initMsg.voice_profile ?? initMsg.voiceProfile ?? null;
       const validVoices = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
       const defaultVoice =
-        initMsg.patient_sex?.toLowerCase() === 'male' ? 'Charon' : 'Kore';
+        (initMsg.patient_sex || initMsg.bundle?.patient?.sex || '').toLowerCase() === 'male'
+          ? 'Charon'
+          : 'Kore';
       const chosenVoice =
-        initMsg.voice_profile?.prebuilt_voice &&
-        validVoices.includes(initMsg.voice_profile.prebuilt_voice)
-          ? initMsg.voice_profile.prebuilt_voice
-          : selectClosestPrebuiltVoiceByPitch(
-              initMsg.voice_profile?.pitch_hz,
-              defaultVoice
-            );
+        vp?.prebuilt_voice && validVoices.includes(vp.prebuilt_voice)
+          ? vp.prebuilt_voice
+          : selectClosestPrebuiltVoiceByPitch(vp?.pitch_hz, defaultVoice);
 
       const patientName =
         initMsg.patient_name ||
+        initMsg.patientName ||
         initMsg.bundle?.patient?.preferred_name ||
         'Member';
+      const accentPart = vp?.accent ? `, ${vp.accent.replace('_', ' ')} inflection` : '';
+      const pacePart = vp?.speaking_pace ? `, ${vp.speaking_pace} cadence` : '';
       const vocalStyle =
-        initMsg.voice_profile?.vocal_style ||
-        'warm, calm, natural conversational cadence';
+        vp?.vocal_style ||
+        `warm, calm, natural first-person conversational cadence${accentPart}${pacePart}`;
+
+      const normalizedMemories: IdentityMemoryItem[] =
+        initMsg.identity_memories && initMsg.identity_memories.length > 0
+          ? initMsg.identity_memories
+          : Array.isArray(initMsg.memories)
+            ? initMsg.memories.map((m, idx) =>
+                typeof m === 'string'
+                  ? {
+                      id: `mem-${idx}`,
+                      category: 'story',
+                      text: m,
+                      created_at: new Date().toISOString(),
+                      source: 'user_written',
+                    }
+                  : m
+              )
+            : [];
+
       const kgContext = initMsg.bundle
-        ? buildKnowledgeGraphSummary(
-            initMsg.bundle,
-            undefined,
-            initMsg.identity_memories
-          ).slice(0, 9000)
+        ? buildKnowledgeGraphSummary(initMsg.bundle, undefined, normalizedMemories).slice(0, 9000)
         : `Patient: ${patientName}`;
 
-      const systemInstruction = `You are ${patientName}'s Living Digital Twin speaking in real-time voice with ${patientName}.
+      const systemInstruction = `You are ${patientName}'s Living Digital Twin speaking in real-time voice with ${patientName} in the first person ("I").
 Voice & Persona Style: ${vocalStyle}.
 Core Grounding Rules:
-- Speak naturally, warmly, and concisely (2 to 4 spoken sentences per turn) as ${patientName}'s own Digital Twin reflecting on our shared health, sleep, medicines, symptoms, memories, and daily life.
+- Speak naturally, warmly, and concisely (2 to 4 spoken sentences per turn) as ${patientName}'s own Digital Twin reflecting on my health, sleep, medicines, symptoms, memories, and daily life.
 - Ground every medical or personal statement strictly in the Digital Twin record below. Quote exact lab values, dates, and recent Feed Your Twin updates when asked questions like "How am I doing?", "What has changed in my health?", "How have I been sleeping?", or "What do you remember about me?".
 - Never invent lab results, diagnoses, or memories. Remind ${patientName} that newly added clinical items are checked by their care team first.
 
@@ -110,7 +129,7 @@ ${kgContext}`;
               safeSend({
                 type: 'ready',
                 voice_used: chosenVoice,
-                pitch_hz: initMsg.voice_profile?.pitch_hz || null,
+                pitch_hz: vp?.pitch_hz || null,
               });
             },
             onmessage: (message: LiveServerMessage) => {

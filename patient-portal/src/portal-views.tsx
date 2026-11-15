@@ -8,7 +8,6 @@ import {
   PHOTO_STORE_KEY,
 } from './preserve';
 import {
-  computePreservationScore,
   computeTwinCompleteness,
   type FaceLikenessData,
   type VoicePersonaData,
@@ -101,10 +100,9 @@ function pickPrimaryBiomarker(bundle: any, formatDate: (d: string) => string) {
 }
 
 /**
- * Upgraded Home Bento Panel (`Oa`):
- * - Removes the duplicate wide descriptive "Feed your twin" card (since `+` Feed icon lives on the 3D Twin stage)
- * - Adds a prominent "Preserve your twin" shortcut card + "Ask your twin ('How am I doing?')" shortcut
- * - Dynamically adapts biomarker sparklines & LE8 scores across all 12 patient profiles
+ * Minimal, calm Home Bento Panel (`Oa`):
+ * - Keeps the Twin overview uncluttered with essential clinical tiles + a quiet Preserve shortcut
+ * - Dynamically adapts biomarker sparklines across all 12 patient profiles
  */
 export function HomeBentoPanel({
   b,
@@ -133,7 +131,7 @@ export function HomeBentoPanel({
   readStore: <T>(key: string, fallback: T) => T;
   formatDate: (d: string) => string;
 }) {
-  const [refreshTick, setRefreshTick] = useState(0);
+  const [, setRefreshTick] = useState(0);
 
   useEffect(() => {
     const bump = () => setRefreshTick((v) => v + 1);
@@ -148,50 +146,13 @@ export function HomeBentoPanel({
   const nextStep = nextStepFn(b);
   const faceProfile = readStore<FaceLikenessData | null>(FACE_STORE_KEY, null);
   const voiceProfile = readStore<VoicePersonaData | null>(SHARED_VOICE_STORE_KEY, null);
-  const memories = readStore<string[]>(MEMORIES_STORE_KEY, []);
   const feedEntries = readStore<FeedEntry[]>('mx-feed', []);
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const preservation = useMemo(
-    () =>
-      computePreservationScore({
-        hasTwinRecord: Boolean(b?.patient),
-        faceLikenessScore: faceProfile?.likeness_score ?? 0,
-        voiceFidelityScore: voiceProfile?.used_real_audio ? voiceProfile.fidelity_score : 0,
-        memoriesCount: memories.length,
-      }),
-    [b?.patient, faceProfile, voiceProfile, memories.length, refreshTick]
-  );
-
   const primaryBio = useMemo(() => pickPrimaryBiomarker(b, formatDate), [b, formatDate]);
-
-  const phq9 = (b?.wellbeing || []).find((w: any) => w.instrument === 'PHQ-9');
-  const gad7 = (b?.wellbeing || []).find((w: any) => w.instrument === 'GAD-7');
-  const fmtWellbeing = (w: any) =>
-    w ? (w.total_low === w.total_high ? `${w.total_low}` : `${w.total_low}-${w.total_high}`) : '-';
 
   const domains: any[] = b?.domains || [];
   const assessedDomains = domains.filter((d) => d.status !== 'none').length;
-
-  const vit = b?.vitals?.[0];
-  const bmi =
-    vit?.height_cm && vit?.weight_kg
-      ? (vit.weight_kg / (vit.height_cm / 100) ** 2).toFixed(1)
-      : null;
-
-  const statTile = (label: string) =>
-    b?.stats?.tiles?.find((t: any) => t.label === label)?.value ?? '-';
-
-  const scoredLe8 = (b?.le8 || []).filter((x: any) => x.points != null);
-  const avgLe8 =
-    scoredLe8.length > 0
-      ? Math.round(
-          scoredLe8.reduce((acc: number, item: any) => acc + Number(item.points || 0), 0) /
-            scoredLe8.length
-        )
-      : null;
-
   const planDone = readStore<string[]>('mx-plan-done', []).length;
+  const hasPreservedIdentity = Boolean(faceProfile || voiceProfile?.used_real_audio);
 
   return (
     <div className="bento">
@@ -207,48 +168,7 @@ export function HomeBentoPanel({
         <span className="bt-cta">{nextStep.label} ›</span>
       </button>
 
-      {/* 2. Prominent Preserve Your Twin shortcut (replaces duplicate wide Feed Your Twin card) */}
-      <button
-        type="button"
-        className="bt wide mx-bento-preserve"
-        onClick={() => go('you', 'preserve')}
-      >
-        <span className="bt-l">
-          <Icon name="preserve" size={18} />
-          Preserve your twin
-        </span>
-        <b>
-          {preservation.totalPct >= 58
-            ? `${preservation.totalPct}% preserved · ${preservation.stageLabel}`
-            : '3D likeness, your own voice & personal memory vault'}
-        </b>
-        <small>
-          {voiceProfile?.used_real_audio && faceProfile
-            ? `3D portrait + ${voiceProfile.prebuilt_voice} (${voiceProfile.pitch_hz || 175} Hz) voice active`
-            : 'Build a permanent digital representation with your face, voice, and life story'}
-        </small>
-        <span className="bt-cta">Open 3D &amp; Voice Studio ›</span>
-      </button>
-
-      {/* 3. Voice-first Ask Your Twin ("How am I doing?") shortcut */}
-      <button
-        type="button"
-        className="bt wide mx-bento-ask"
-        onClick={() => go('you', 'checkin:ask')}
-      >
-        <span className="bt-l">
-          <Icon name="checkin" size={18} />
-          Ask your twin · Voice &amp; 3D
-        </span>
-        <b>“How am I doing overall right now?”</b>
-        <small>
-          Speak to yourself in your own voice — grounded in {counts.knows} clinical facts
-          {feedEntries.length > 0 ? ` + ${feedEntries.length} personal updates` : ''}
-        </small>
-        <span className="bt-cta">Speak with Twin ›</span>
-      </button>
-
-      {/* 4. Dynamic primary biomarker sparkline for ANY of the 12 patients */}
+      {/* 2. Primary biomarker & Health areas */}
       {primaryBio && (
         <button
           type="button"
@@ -274,7 +194,6 @@ export function HomeBentoPanel({
         </button>
       )}
 
-      {/* 5. Health areas */}
       <button type="button" className="bt" onClick={() => go('panel')}>
         <span className="bt-l">
           <Icon name="twin" size={18} />
@@ -290,33 +209,7 @@ export function HomeBentoPanel({
         <small>with data · panel adds {panelUnlockCountFn(b)}</small>
       </button>
 
-      {/* 6. Mood & Worry (when present in bundle) */}
-      {phq9 && (
-        <button type="button" className="bt" onClick={() => go('twin', 'o:brain')}>
-          <span className="bt-l">
-            <Icon name="mind" size={18} />
-            Mood
-          </span>
-          <b className="bt-v mx-tabular">{fmtWellbeing(phq9)}</b>
-          <small>PHQ-9 · {phq9.band_high}</small>
-        </button>
-      )}
-
-      {gad7 && (
-        <button type="button" className="bt" onClick={() => go('twin', 'o:brain')}>
-          <span className="bt-l">
-            <Icon name="mind" size={18} />
-            Worry
-          </span>
-          <b className="bt-v mx-tabular">{fmtWellbeing(gad7)}</b>
-          <small>
-            GAD-7 · {gad7.band_low}
-            {gad7.band_high !== gad7.band_low ? ` to ${gad7.band_high}` : ''}
-          </small>
-        </button>
-      )}
-
-      {/* 7. Biological age */}
+      {/* 3. Biological age */}
       <button type="button" className="bt wide bio-t" onClick={onBio}>
         <span className="bt-l">
           <Icon name="twin" size={18} />
@@ -341,7 +234,7 @@ export function HomeBentoPanel({
         )}
       </button>
 
-      {/* 8. Findings & BMI */}
+      {/* 4. Findings & Action plan */}
       <button type="button" className="bt" onClick={() => go('research', 'findings')}>
         <span className="bt-l">
           <Icon name="research" size={18} />
@@ -355,18 +248,19 @@ export function HomeBentoPanel({
         </small>
       </button>
 
-      {bmi && (
-        <button type="button" className="bt" onClick={() => go('you', 'health')}>
-          <span className="bt-l">
-            <Icon name="heart" size={18} />
-            BMI
-          </span>
-          <b className="bt-v mx-tabular">{bmi}</b>
-          <small>height and weight</small>
-        </button>
-      )}
+      <button type="button" className="bt" onClick={() => go('you', 'plan')}>
+        <span className="bt-l">
+          <Icon name="lifestyle" size={18} />
+          Action plan
+        </span>
+        <b className="bt-v mx-tabular">
+          {planDone}
+          <small>/{b?.action_plan?.length ?? 0}</small>
+        </b>
+        <small>steps done</small>
+      </button>
 
-      {/* 9. Provenance tiles */}
+      {/* 5. Core record provenance */}
       <button type="button" className="bt" onClick={() => open('knows')}>
         <span className="bt-l">
           <Icon name="checkin" size={18} />
@@ -385,64 +279,24 @@ export function HomeBentoPanel({
         <small>shown, never guessed</small>
       </button>
 
-      <button type="button" className="bt" onClick={() => open('changed')}>
-        <span className="bt-l">
-          <Icon name="research" size={18} />
-          Changes
-        </span>
-        <b className="bt-v mx-tabular">{counts.changed}</b>
-        <small>over time</small>
-      </button>
-
-      <button type="button" className="bt" onClick={() => open('sources')}>
-        <span className="bt-l">
-          <Icon name="share" size={18} />
-          Sources
-        </span>
-        <b className="bt-v mx-tabular">{counts.sources}</b>
-        <small>where it came from</small>
-      </button>
-
-      {/* 10. Research summary */}
-      <button type="button" className="bt wide research-t" onClick={() => go('research', null)}>
-        <span className="bt-l">
-          <Icon name="research" size={18} />
-          Research on your record
-        </span>
-        <span className="bt-row">
+      {/* 6. Minimal Preserve shortcut */}
+      <button
+        type="button"
+        className="bt wide mx-bento-preserve-min"
+        onClick={() => go('you', 'preserve')}
+      >
+        <span className="mx-bento-preserve-left">
+          <Icon name="preserve" size={18} />
           <span>
-            <b className="mx-tabular">{statTile('verified findings')}</b>
-            <small>checked findings</small>
+            <b>Preserve yourself</b>
+            <small>
+              {hasPreservedIdentity ? 'Saved to your twin' : 'Likeness, voice & memory'}
+            </small>
           </span>
         </span>
-      </button>
-
-      {/* 11. Accurate LE8 Heart Habits across all 12 patients */}
-      <button type="button" className="bt" onClick={() => go('twin', 'stats')}>
-        <span className="bt-l">
-          <Icon name="heart" size={18} />
-          Heart habits
+        <span className="mx-bento-preserve-arrow" aria-hidden="true">
+          ›
         </span>
-        <b className="bt-v mx-tabular">
-          {scoredLe8.length}
-          <small>/8</small>
-        </b>
-        <small>
-          {avgLe8 !== null ? `scored · avg ${avgLe8}/100` : 'complete check-in to score'}
-        </small>
-      </button>
-
-      {/* 12. Action plan */}
-      <button type="button" className="bt" onClick={() => go('you', 'plan')}>
-        <span className="bt-l">
-          <Icon name="lifestyle" size={18} />
-          Action plan
-        </span>
-        <b className="bt-v mx-tabular">
-          {planDone}
-          <small>/{b?.action_plan?.length ?? 0}</small>
-        </b>
-        <small>steps done</small>
       </button>
 
       <button type="button" className="bt wide link-t" onClick={() => go('twin', 'stats')}>
