@@ -180,3 +180,101 @@ test('preserve-math: convergence score, valid RIFF WAV header, and lip-sync enve
   const mouthOpen = computeSyntheticSpeechMouthOpen(0.18, 150);
   assert.ok(mouthOpen >= 0 && mouthOpen <= 1);
 });
+
+test('preserve-math: F0 vocal pitch autocorrelation and spectral brightness detection', async () => {
+  const { estimateAutocorrelationPitchHz, estimateSpectralBrightness } = await import(
+    './preserve-math'
+  );
+
+  // Synthesize a pure 160 Hz voiced harmonic signal at 16 kHz and verify autocorrelation F0 detection
+  const sampleRate = 16000;
+  const durationSec = 0.5;
+  const totalSamples = sampleRate * durationSec;
+  const pcm = new Float32Array(totalSamples);
+  for (let i = 0; i < totalSamples; i++) {
+    const t = i / sampleRate;
+    pcm[i] =
+      0.6 * Math.sin(2 * Math.PI * 160 * t) +
+      0.25 * Math.sin(2 * Math.PI * 320 * t);
+  }
+  const detectedHz = estimateAutocorrelationPitchHz(pcm, sampleRate);
+  assert.ok(detectedHz !== null && Math.abs(detectedHz - 160) <= 3);
+
+  const brightness = estimateSpectralBrightness(pcm, sampleRate);
+  assert.ok(brightness >= 25 && brightness <= 95);
+});
+
+test('preserve-math: computeTwinCompleteness, buildSelfPerspectivePrompts, and analyzeAudioSamplesQuality', async () => {
+  const {
+    analyzeAudioSamplesQuality,
+    buildSelfPerspectivePrompts,
+    computeTwinCompleteness,
+  } = await import('./preserve-math');
+  const { FEED_CATEGORIES, inferCategoryFromEntry } = await import('./feed-categories');
+
+  assert.equal(FEED_CATEGORIES.length, 8);
+  assert.equal(
+    inferCategoryFromEntry({
+      id: '1',
+      at: '2026-11-14',
+      kind: 'diary',
+      date: '2026-11-14',
+      title: 'Evening reflection',
+      detail: 'Felt energized after walk',
+    }),
+    'personal_diary'
+  );
+
+  const sampleBundle = {
+    patient: {
+      preferred_name: 'Anika',
+      medicines: ['Levothyroxine 50 mcg'],
+      supplements: ['Vitamin D3'],
+    },
+    domains: [
+      { id: 'heart', status: 'checked' },
+      { id: 'kidneys', status: 'attention' },
+      { id: 'genes', status: 'none' },
+    ],
+    labs: { TSH: [{ date: '2026-11-01', value: 4.8, unit: 'mIU/L' }] },
+    le8: [{ name: 'Sleep health', points: 80 }],
+    organs: { kidneys: { label: 'Kidneys', state: 'attention' } },
+  };
+
+  const completeness = computeTwinCompleteness({
+    bundle: sampleBundle,
+    feedCount: 2,
+    hasFace: true,
+    hasVoice: true,
+    memoriesCount: 3,
+  });
+  assert.ok(completeness.totalPct >= 65 && completeness.totalPct <= 100);
+  assert.equal(completeness.assessedDomains, 2);
+  assert.equal(completeness.totalDomains, 3);
+  assert.equal(completeness.statusLabel, '3D likeness & personal voice preserved');
+
+  const prompts = buildSelfPerspectivePrompts(sampleBundle, 2, 2);
+  assert.equal(prompts[0], 'How am I doing overall right now?');
+  assert.equal(
+    prompts.some((p) => /how are you doing/i.test(p)),
+    false,
+    'Prompts must strictly use first-person self-perspective ("How am I doing?"), never "How are you doing?"'
+  );
+  assert.equal(
+    prompts.some((p) => /medicines and supplements am I taking/i.test(p)),
+    true
+  );
+
+  // Clean synthetic speech-like signal with quiet start/end frames -> high SNR, zero clipping
+  const sr = 16000;
+  const signal = new Float32Array(sr);
+  for (let i = 0; i < sr; i++) {
+    signal[i] = i > 2500 && i < 13500 ? 0.35 * Math.sin((2 * Math.PI * 180 * i) / sr) : 0.001;
+  }
+  const quality = analyzeAudioSamplesQuality(signal, sr);
+  assert.equal(quality.clipping, false);
+  assert.ok(quality.snrDb >= 20);
+  assert.equal(quality.qualityLabel, 'Studio Clear');
+});
+
+

@@ -1,29 +1,58 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  fetchEncryptedVault,
+  purgeEncryptedVault,
+  saveEncryptedVault,
+} from './auth-context';
+import {
   computePreservationScore,
   createSampleVoiceWavBase64,
+  type AudioQualityReport,
   type FaceLikenessData,
   type PreservedTurn,
   type VoicePersonaData,
 } from './preserve-math';
 import { PreserveAvatarStage } from './preserve-stage';
-import type { PortalHostBridge } from './types';
+import type {
+  FeedEntry,
+  IdentityMemoryItem,
+  MemoryCategory,
+  PortalHostBridge,
+  VoiceClipMeta,
+  VoiceConsentData,
+} from './types';
+import {
+  analyzeBlobAcoustics,
+  playMatchedVoiceReply,
+  requestMatchedVoiceSynthesis,
+  resolvePortalApiUrl,
+  SHARED_VOICE_CLIPS_KEY,
+  SHARED_VOICE_CONSENT_KEY,
+  SHARED_VOICE_STORE_KEY,
+  stopActiveVoicePlayback,
+  trainAndTranscribeUserVoice,
+  VOICE_UPDATED_EVENT,
+} from './voice-engine';
 
-const FACE_STORE_KEY = 'mx-preserve-face-v1';
-const PHOTO_STORE_KEY = 'mx-preserve-photo-v1';
-const PHOTO_COUNT_KEY = 'mx-preserve-photo-count-v1';
-const VOICE_STORE_KEY = 'mx-preserve-voice-v1';
-const MEMORIES_STORE_KEY = 'mx-preserve-memories-v1';
-const TURNS_STORE_KEY = 'mx-preserve-turns-v1';
+export const FACE_STORE_KEY = 'mx-preserve-face-v1';
+export const PHOTO_STORE_KEY = 'mx-preserve-photo-v1';
+export const PHOTO_ANGLES_STORE_KEY = 'mx-preserve-photo-angles-v1';
+export const PHOTO_COUNT_KEY = 'mx-preserve-photo-count-v1';
+export const MEMORIES_STORE_KEY = 'mx-preserve-memories-v1';
+export const MEMORY_ITEMS_STORE_KEY = 'mx-preserve-memory-items-v1';
+export const TURNS_STORE_KEY = 'mx-preserve-turns-v1';
 const WAITLIST_KEY = 'mx-preserve-interest';
 
-const VITE_ASK_URL: string =
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_ASK_URL) || '';
+type StudioStep = 'all' | 'step1' | 'step2' | 'step3';
+type PhotoAngleSlot = 'front' | 'threeQuarter' | 'profile';
 
-function resolveApiUrl(path: string, hostApiBase?: string): string {
-  const base = (VITE_ASK_URL || hostApiBase || '').replace(/\/$/, '');
-  return `${base}${path}`;
-}
+const MEMORY_CATEGORIES: Array<[MemoryCategory, string]> = [
+  ['life_story', 'Life Story'],
+  ['values', 'Core Values'],
+  ['habits', 'Daily Habits & Routines'],
+  ['communication_style', 'How I Speak & Think'],
+  ['milestone', 'Significant Milestone'],
+];
 
 function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -42,10 +71,6 @@ function stripDataUrlPrefix(dataUrl: string): string {
   return idx >= 0 ? dataUrl.slice(idx + 1) : dataUrl;
 }
 
-/**
- * Downscales large uploaded photos to max 512px JPEG so 3D texture loading and
- * localStorage persistence stay fast and well within browser storage limits.
- */
 function resizeImageToDataUrl(fileOrBlob: Blob, maxDim = 512): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -64,7 +89,7 @@ function resizeImageToDataUrl(fileOrBlob: Blob, maxDim = 512): Promise<string> {
         return;
       }
       ctx.drawImage(img, 0, 0, w, h);
-      resolve(canvas.toDataURL('image/jpeg', 0.86));
+      resolve(canvas.toDataURL('image/jpeg', 0.88));
     };
     img.onerror = () => {
       URL.revokeObjectURL(objUrl);
@@ -74,6 +99,22 @@ function resizeImageToDataUrl(fileOrBlob: Blob, maxDim = 512): Promise<string> {
   });
 }
 
+function normalizeMemoryItems(
+  storedItems: IdentityMemoryItem[] | null,
+  legacyStrings: string[]
+): IdentityMemoryItem[] {
+  if (Array.isArray(storedItems) && storedItems.length > 0) {
+    return storedItems;
+  }
+  return legacyStrings.map((txt, idx) => ({
+    id: `mem-seed-${idx}`,
+    at: new Date().toISOString(),
+    category: idx === 0 ? 'values' : 'life_story',
+    text: txt,
+    source: 'written',
+  }));
+}
+
 export function PreserveScreen({
   b,
   host,
@@ -81,68 +122,101 @@ export function PreserveScreen({
   b: any;
   host: PortalHostBridge;
 }) {
+  const patientId = host.getPatientId();
   const patientName: string = b?.patient?.preferred_name || 'Member';
   const preserveMeta = b?.preserve || {};
   const Hero = host.Hero;
 
+  const [activeStep, setActiveStep] = useState<StudioStep>('all');
+
+  // Step 1: Visual Identity state
   const [faceProfile, setFaceProfile] = useState<FaceLikenessData | null>(() =>
     host.readStore<FaceLikenessData | null>(FACE_STORE_KEY, null)
   );
   const [portraitDataUrl, setPortraitDataUrl] = useState<string | null>(() =>
     host.readStore<string | null>(PHOTO_STORE_KEY, null)
   );
+  const [photoAngles, setPhotoAngles] = useState<Partial<Record<PhotoAngleSlot, string>>>(() =>
+    host.readStore<Partial<Record<PhotoAngleSlot, string>>>(PHOTO_ANGLES_STORE_KEY, {})
+  );
   const [photoCount, setPhotoCount] = useState<number>(() =>
     host.readStore<number>(PHOTO_COUNT_KEY, 0)
   );
-  const [voiceProfile, setVoiceProfile] = useState<VoicePersonaData | null>(() =>
-    host.readStore<VoicePersonaData | null>(VOICE_STORE_KEY, null)
-  );
-  const [memories, setMemories] = useState<string[]>(() =>
-    host.readStore<string[]>(MEMORIES_STORE_KEY, [
-      `I value calm, clear thinking, long walks outdoors, and taking steady care of my family and long-term health.`,
-    ])
-  );
-  const [turns, setTurns] = useState<PreservedTurn[]>(() =>
-    host.readStore<PreservedTurn[]>(TURNS_STORE_KEY, [])
-  );
-
-  // Sync patient-scoped store when switching patients
-  useEffect(() => {
-    setFaceProfile(host.readStore<FaceLikenessData | null>(FACE_STORE_KEY, null));
-    setPortraitDataUrl(host.readStore<string | null>(PHOTO_STORE_KEY, null));
-    setPhotoCount(host.readStore<number>(PHOTO_COUNT_KEY, 0));
-    setVoiceProfile(host.readStore<VoicePersonaData | null>(VOICE_STORE_KEY, null));
-    setMemories(
-      host.readStore<string[]>(MEMORIES_STORE_KEY, [
-        `I value calm, clear thinking, long walks outdoors, and taking steady care of my family and long-term health.`,
-      ])
-    );
-    setTurns(host.readStore<PreservedTurn[]>(TURNS_STORE_KEY, []));
-  }, [b, host]);
-
-  // Photo state
-  const [faceBusy, setFaceBusy] = useState(false);
+  const [faceBusyStage, setFaceBusyStage] = useState<string | null>(null);
   const [faceError, setFaceError] = useState<string | null>(null);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
 
-  // Voice training state
+  // Step 2: Voice Identity & Consent state
+  const [voiceProfile, setVoiceProfile] = useState<VoicePersonaData | null>(() =>
+    host.readStore<VoicePersonaData | null>(SHARED_VOICE_STORE_KEY, null)
+  );
+  const [voiceConsent, setVoiceConsent] = useState<VoiceConsentData>(() =>
+    host.readStore<VoiceConsentData>(SHARED_VOICE_CONSENT_KEY, {
+      consented: true,
+      consentedAt: new Date().toISOString(),
+      allowConversationalRefinement: true,
+      encryptedAtRest: true,
+    })
+  );
+  const [voiceClips, setVoiceClips] = useState<VoiceClipMeta[]>(() =>
+    host.readStore<VoiceClipMeta[]>(SHARED_VOICE_CLIPS_KEY, [])
+  );
+  const [lastQuality, setLastQuality] = useState<AudioQualityReport | null>(null);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
   const [lastTranscript, setLastTranscript] = useState<string>('');
-  const [voicePhrase, setVoicePhrase] = useState<string>(
-    `Hi, I’m ${patientName}. When things get busy, I like to take a breath, look at the facts clearly, and take one steady step at a time.`
+  const [passageIdx, setPassageIdx] = useState(0);
+  const calibrationPassages = useMemo(
+    () => [
+      `Hi, I’m ${patientName}. When things get busy, I like to take a breath, look at the facts clearly, and take one steady step at a time.`,
+      `I want my digital twin to remember how I speak, what keeps me grounded, and how I care for my health and the people closest to me.`,
+      `Even on a tired day, a quiet morning walk, good sleep, and honest conversations always help me reset my energy.`,
+    ],
+    [patientName]
   );
+  const [voicePhrase, setVoicePhrase] = useState<string>(calibrationPassages[0]);
   const [isRecordingMic, setIsRecordingMic] = useState(false);
+  const [abSynthesizedWav, setAbSynthesizedWav] = useState<string | null>(null);
+  const [abBusy, setAbBusy] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
 
-  // Conversation / TTS playback state
+  // Step 3: Personal Identity & Memory Vault state
+  const [memoryItems, setMemoryItems] = useState<IdentityMemoryItem[]>(() => {
+    const legacy = host.readStore<string[]>(MEMORIES_STORE_KEY, [
+      `I value calm, clear thinking, long walks outdoors, and taking steady care of my family and long-term health.`,
+    ]);
+    const rich = host.readStore<IdentityMemoryItem[] | null>(MEMORY_ITEMS_STORE_KEY, null);
+    return normalizeMemoryItems(rich, legacy);
+  });
+  const [newMemoryCategory, setNewMemoryCategory] = useState<MemoryCategory>('life_story');
+  const [newMemoryText, setNewMemoryText] = useState('');
+  const [isRecordingMemory, setIsRecordingMemory] = useState(false);
+  const memoryRecRef = useRef<MediaRecorder | null>(null);
+  const memoryChunksRef = useRef<Blob[]>([]);
+
+  // Linked diary entries from Feed Your Twin
+  const feedDiaryEntries = useMemo(() => {
+    const allFeed = host.readStore<FeedEntry[]>('mx-feed', []);
+    return allFeed.filter(
+      (e) => e.category === 'personal_diary' || e.kind === 'diary'
+    );
+  }, [b, host, memoryItems.length]);
+
+  // First-person speech turns & live audio level
+  const [turns, setTurns] = useState<PreservedTurn[]>(() =>
+    host.readStore<PreservedTurn[]>(TURNS_STORE_KEY, [])
+  );
   const [speakInput, setSpeakInput] = useState('');
   const [speakBusy, setSpeakBusy] = useState(false);
   const [speakError, setSpeakError] = useState<string | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const liveAudioLevelRef = useRef<number>(0);
 
-  // Memories & Waitlist state
-  const [newMemory, setNewMemory] = useState('');
+  // Archive preferences
   const [waitlistPicks, setWaitlistPicks] = useState<string[]>(() => {
     try {
       return JSON.parse(localStorage.getItem(WAITLIST_KEY) || '[]');
@@ -151,109 +225,97 @@ export function PreserveScreen({
     }
   });
   const [waitlistSaved, setWaitlistSaved] = useState(false);
-
-  // Web Audio lip-sync analyser refs
-  const audioElRef = useRef<HTMLAudioElement | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const freqBinsRef = useRef<Uint8Array<ArrayBuffer> | null>(null);
-  const fallbackSpeakTimerRef = useRef<number>(0);
+  const [vaultSyncedAt, setVaultSyncedAt] = useState<string | null>(null);
 
   useEffect(() => {
-    setVoicePhrase(
-      `Hi, I’m ${patientName}. When things get busy, I like to take a breath, look at the facts clearly, and take one steady step at a time.`
+    setVoicePhrase(calibrationPassages[passageIdx] || calibrationPassages[0]);
+  }, [calibrationPassages, passageIdx]);
+
+  // Sync patient-scoped store + encrypted server vault when switching patients
+  useEffect(() => {
+    const localFace = host.readStore<FaceLikenessData | null>(FACE_STORE_KEY, null);
+    const localPhoto = host.readStore<string | null>(PHOTO_STORE_KEY, null);
+    const localAngles = host.readStore<Partial<Record<PhotoAngleSlot, string>>>(
+      PHOTO_ANGLES_STORE_KEY,
+      {}
     );
-  }, [patientName]);
+    const localCount = host.readStore<number>(PHOTO_COUNT_KEY, 0);
+    const localVoice = host.readStore<VoicePersonaData | null>(SHARED_VOICE_STORE_KEY, null);
+    const localConsent = host.readStore<VoiceConsentData>(SHARED_VOICE_CONSENT_KEY, {
+      consented: true,
+      consentedAt: new Date().toISOString(),
+      allowConversationalRefinement: true,
+      encryptedAtRest: true,
+    });
+    const localClips = host.readStore<VoiceClipMeta[]>(SHARED_VOICE_CLIPS_KEY, []);
+    const legacyMems = host.readStore<string[]>(MEMORIES_STORE_KEY, [
+      `I value calm, clear thinking, long walks outdoors, and taking steady care of my family and long-term health.`,
+    ]);
+    const richMems = host.readStore<IdentityMemoryItem[] | null>(MEMORY_ITEMS_STORE_KEY, null);
+
+    setFaceProfile(localFace);
+    setPortraitDataUrl(localPhoto);
+    setPhotoAngles(localAngles);
+    setPhotoCount(localCount);
+    setVoiceProfile(localVoice);
+    setVoiceConsent(localConsent);
+    setVoiceClips(localClips);
+    setMemoryItems(normalizeMemoryItems(richMems, legacyMems));
+    setTurns(host.readStore<PreservedTurn[]>(TURNS_STORE_KEY, []));
+    setAbSynthesizedWav(null);
+
+    let cancelled = false;
+    fetchEncryptedVault(patientId, host.apiBase).then((vault) => {
+      if (cancelled || !vault) return;
+      if (vault.faceProfile && !localFace) {
+        setFaceProfile(vault.faceProfile);
+        host.writeStore(FACE_STORE_KEY, vault.faceProfile);
+      }
+      if (vault.portraitDataUrl && !localPhoto) {
+        setPortraitDataUrl(vault.portraitDataUrl);
+        host.writeStore(PHOTO_STORE_KEY, vault.portraitDataUrl);
+      }
+      if (vault.voiceProfile && !localVoice) {
+        setVoiceProfile(vault.voiceProfile);
+        host.writeStore(SHARED_VOICE_STORE_KEY, vault.voiceProfile);
+      }
+      if (Array.isArray(vault.memories) && vault.memories.length > 0 && !richMems) {
+        setMemoryItems(vault.memories);
+        host.writeStore(MEMORY_ITEMS_STORE_KEY, vault.memories);
+      }
+      if (vault.updatedAt) {
+        setVaultSyncedAt(vault.updatedAt);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [patientId, b, host]);
 
   useEffect(() => {
     return () => {
-      window.clearTimeout(fallbackSpeakTimerRef.current);
-      if (audioElRef.current) {
-        audioElRef.current.pause();
-        audioElRef.current = null;
-      }
-      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-        void audioCtxRef.current.close().catch(() => {});
+      stopActiveVoicePlayback();
+      if (cameraStreamRef.current) {
+        cameraStreamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
   }, []);
 
-  const getAudioLevel = (): number => {
-    const analyser = analyserRef.current;
-    const bins = freqBinsRef.current;
-    if (!analyser || !bins) return 0;
-    analyser.getByteFrequencyData(bins);
-    let sum = 0;
-    const count = Math.min(36, bins.length);
-    for (let i = 1; i < count; i++) {
-      sum += bins[i];
-    }
-    return count > 1 ? sum / ((count - 1) * 255) : 0;
-  };
-
-  const playWavBase64WithLipSync = async (
-    wavBase64: string | null,
-    replyText: string
-  ) => {
-    window.clearTimeout(fallbackSpeakTimerRef.current);
-    if (audioElRef.current) {
-      audioElRef.current.pause();
-      audioElRef.current = null;
-    }
-
-    const estDurationMs = Math.max(
-      2600,
-      Math.min(14000, replyText.split(/\s+/).length * 380)
-    );
-
-    if (!wavBase64) {
-      setIsSpeaking(true);
-      fallbackSpeakTimerRef.current = window.setTimeout(() => {
-        setIsSpeaking(false);
-      }, estDurationMs);
-      return;
-    }
-
-    try {
-      const audio = new Audio(`data:audio/wav;base64,${wavBase64}`);
-      audioElRef.current = audio;
-
-      const AudioCtx =
-        window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      if (AudioCtx) {
-        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
-          audioCtxRef.current = new AudioCtx();
-        }
-        if (audioCtxRef.current.state === 'suspended') {
-          await audioCtxRef.current.resume().catch(() => {});
-        }
-        const sourceNode = audioCtxRef.current.createMediaElementSource(audio);
-        const analyser = audioCtxRef.current.createAnalyser();
-        analyser.fftSize = 128;
-        analyser.smoothingTimeConstant = 0.65;
-        sourceNode.connect(analyser);
-        analyser.connect(audioCtxRef.current.destination);
-        analyserRef.current = analyser;
-        freqBinsRef.current = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
-      }
-
-      audio.onended = () => {
-        setIsSpeaking(false);
-      };
-      audio.onerror = () => {
-        setIsSpeaking(false);
-      };
-
-      setIsSpeaking(true);
-      await audio.play();
-    } catch {
-      // If autoplay/audio hardware is restricted in headless browser, still animate speech duration
-      setIsSpeaking(true);
-      fallbackSpeakTimerRef.current = window.setTimeout(() => {
-        setIsSpeaking(false);
-      }, estDurationMs);
+  const syncToServerVault = async (patch: Record<string, unknown>) => {
+    const saved = await saveEncryptedVault(patientId, patch, host.apiBase);
+    if (saved?.updatedAt) {
+      setVaultSyncedAt(saved.updatedAt);
     }
   };
+
+  const memoryStrings = useMemo(
+    () => [
+      ...memoryItems.map((m) => m.text),
+      ...feedDiaryEntries.map((d) => `${d.title}: ${d.detail}`),
+    ],
+    [memoryItems, feedDiaryEntries]
+  );
 
   const convergence = useMemo(
     () =>
@@ -261,20 +323,37 @@ export function PreserveScreen({
         hasTwinRecord: Boolean(b?.patient),
         faceLikenessScore: faceProfile?.likeness_score ?? 0,
         voiceFidelityScore: voiceProfile?.fidelity_score ?? 0,
-        memoriesCount: memories.length,
+        memoriesCount: memoryItems.length + feedDiaryEntries.length,
       }),
-    [b, faceProfile, voiceProfile, memories.length]
+    [b, faceProfile, voiceProfile, memoryItems.length, feedDiaryEntries.length]
   );
 
-  // === Handlers: 1. Photo & 3D Face Likeness ===
-  const processPortraitBlob = async (blob: Blob) => {
-    setFaceBusy(true);
+  const playWavWithAvatarLipSync = async (wavBase64: string | null, spokenText: string) => {
+    await playMatchedVoiceReply(wavBase64, spokenText, voiceProfile, {
+      onStart: () => setIsSpeaking(true),
+      onLevel: (lvl) => {
+        liveAudioLevelRef.current = lvl;
+      },
+      onEnd: () => {
+        liveAudioLevelRef.current = 0;
+        setIsSpeaking(false);
+      },
+    });
+  };
+
+  // === STEP 1 HANDLERS: APPEARANCE & 3D LIKENESS ===
+  const processPortraitBlob = async (blob: Blob, slot: PhotoAngleSlot = 'front') => {
     setFaceError(null);
+    setFaceBusyStage('Uploading reference portrait…');
     try {
       const resizedDataUrl = await resizeImageToDataUrl(blob, 512);
-      const nextCount = photoCount + 1;
+      setFaceBusyStage('Analyzing cranial proportions & facial landmarks…');
+
+      const nextAngles = { ...photoAngles, [slot]: resizedDataUrl };
+      const nextCount = Math.max(Object.keys(nextAngles).length, photoCount + 1);
+
       const resp = await fetch(
-        resolveApiUrl('/v1/preserve/face-analyze', host.apiBase),
+        resolvePortalApiUrl('/v1/preserve/face-analyze', host.apiBase),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -286,73 +365,195 @@ export function PreserveScreen({
         }
       );
       if (!resp.ok) {
-        throw new Error(`Face likeness analysis returned ${resp.status}`);
+        throw new Error(`Face likeness analysis returned HTTP ${resp.status}`);
       }
+      setFaceBusyStage('Sculpting 3D mesh & feathering skin texture…');
       const data = (await resp.json()) as FaceLikenessData;
-      setPortraitDataUrl(resizedDataUrl);
+
+      const primaryPortrait = slot === 'front' || !portraitDataUrl ? resizedDataUrl : portraitDataUrl;
+      setPortraitDataUrl(primaryPortrait);
+      setPhotoAngles(nextAngles);
       setFaceProfile(data);
       setPhotoCount(nextCount);
-      host.writeStore(PHOTO_STORE_KEY, resizedDataUrl);
+
+      host.writeStore(PHOTO_STORE_KEY, primaryPortrait);
+      host.writeStore(PHOTO_ANGLES_STORE_KEY, nextAngles);
       host.writeStore(FACE_STORE_KEY, data);
       host.writeStore(PHOTO_COUNT_KEY, nextCount);
+
+      void syncToServerVault({
+        faceProfile: data,
+        portraitDataUrl: primaryPortrait,
+        photoAngles: Object.values(nextAngles).filter(Boolean),
+      });
     } catch (err: any) {
       setFaceError(err?.message || 'Could not analyze portrait photo right now.');
     } finally {
-      setFaceBusy(false);
+      setFaceBusyStage(null);
     }
   };
 
   const handleUseSamplePortrait = async () => {
-    setFaceBusy(true);
     setFaceError(null);
+    setFaceBusyStage('Loading studio reference portrait…');
     try {
       const resp = await fetch('./sample-portrait.jpg', { cache: 'no-store' });
       if (!resp.ok) throw new Error('Sample portrait asset not found');
       const blob = await resp.blob();
-      await processPortraitBlob(blob);
+      await processPortraitBlob(blob, 'front');
     } catch (err: any) {
-      setFaceBusy(false);
+      setFaceBusyStage(null);
       setFaceError(err?.message || 'Could not load sample portrait.');
     }
   };
 
-  // === Handlers: 2. AI Voice Persona Training ===
-  const submitVoiceSample = async (
-    audioBase64: string | undefined,
-    mimeType: string | undefined,
-    transcriptHint: string
-  ) => {
+  const handleStartCamera = async () => {
+    setFaceError(null);
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setFaceError('Camera access is not available in this browser — upload a photo or use the sample portrait.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 640 } },
+      });
+      cameraStreamRef.current = stream;
+      setCameraOpen(true);
+      window.setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          void videoRef.current.play().catch(() => {});
+        }
+      }, 60);
+    } catch {
+      setFaceError('Camera permission was declined or no webcam was found. Please upload a photo instead.');
+    }
+  };
+
+  const handleSnapCameraPhoto = async () => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = vid.videoWidth || 512;
+    canvas.height = vid.videoHeight || 512;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
+    cameraStreamRef.current = null;
+    setCameraOpen(false);
+    canvas.toBlob(
+      (blob) => {
+        if (blob) void processPortraitBlob(blob, 'front');
+      },
+      'image/jpeg',
+      0.9
+    );
+  };
+
+  const updateFaceField = <K extends keyof FaceLikenessData>(key: K, val: FaceLikenessData[K]) => {
+    if (!faceProfile) return;
+    const next = { ...faceProfile, [key]: val };
+    setFaceProfile(next);
+    host.writeStore(FACE_STORE_KEY, next);
+    void syncToServerVault({ faceProfile: next });
+  };
+
+  const handleClearAppearance = () => {
+    setFaceProfile(null);
+    setPortraitDataUrl(null);
+    setPhotoAngles({});
+    setPhotoCount(0);
+    host.writeStore(FACE_STORE_KEY, null);
+    host.writeStore(PHOTO_STORE_KEY, null);
+    host.writeStore(PHOTO_ANGLES_STORE_KEY, {});
+    host.writeStore(PHOTO_COUNT_KEY, 0);
+  };
+
+  // === STEP 2 HANDLERS: PERSONAL VOICE PRESERVATION ===
+  const updateConsent = (patch: Partial<VoiceConsentData>) => {
+    const next: VoiceConsentData = {
+      ...voiceConsent,
+      ...patch,
+      consentedAt:
+        patch.consented === true
+          ? new Date().toISOString()
+          : patch.consented === false
+            ? null
+            : voiceConsent.consentedAt,
+    };
+    setVoiceConsent(next);
+    host.writeStore(SHARED_VOICE_CONSENT_KEY, next);
+    void syncToServerVault({ voiceConsent: next });
+  };
+
+  const submitRealAudioVoiceSample = async (params: {
+    audioBase64: string;
+    audioDataUrl: string;
+    mimeType: string;
+    sourceType: 'recorded_audio' | 'uploaded_audio';
+    transcriptHint: string;
+    pitchHz: number | null;
+    brightness: number;
+    quality: AudioQualityReport;
+  }) => {
+    if (!voiceConsent.consented) {
+      setVoiceError('Please confirm voice-preservation consent first before building your voice profile.');
+      return;
+    }
     setVoiceBusy(true);
     setVoiceError(null);
+    setVoiceNotice(null);
+    setLastQuality(params.quality);
     try {
-      const nextSamples = (voiceProfile?.sample_count || 0) + 1;
-      const resp = await fetch(
-        resolveApiUrl('/v1/preserve/voice-train', host.apiBase),
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            audio_base64: audioBase64,
-            mime_type: mimeType,
-            transcript_hint: transcriptHint,
-            patient_name: patientName,
-            sample_count: nextSamples,
-            existing_profile: voiceProfile || undefined,
-          }),
-        }
-      );
-      if (!resp.ok) {
-        throw new Error(`Voice model training returned ${resp.status}`);
-      }
-      const data = (await resp.json()) as {
-        transcript: string;
-        profile: VoicePersonaData;
+      const data = await trainAndTranscribeUserVoice({
+        audioBase64: params.audioBase64,
+        mimeType: params.mimeType,
+        sourceType: params.sourceType,
+        consentVerified: true,
+        transcriptHint: params.transcriptHint,
+        patientName,
+        measuredPitchHz: params.pitchHz,
+        measuredBrightness: params.brightness,
+        existingProfile: voiceProfile,
+        apiBase: host.apiBase,
+      });
+
+      const clipMeta: VoiceClipMeta = {
+        id: `vc-${Date.now()}`,
+        at: new Date().toISOString(),
+        sourceType: params.sourceType,
+        durationSec: params.quality.durationSec,
+        snrDb: params.quality.snrDb,
+        pitchHz: data.profile.pitch_hz ?? params.pitchHz,
+        transcript: data.transcript || params.transcriptHint,
+        audioDataUrl: params.audioDataUrl.length < 480_000 ? params.audioDataUrl : undefined,
       };
-      setLastTranscript(data.transcript || transcriptHint);
+      const nextClips = [clipMeta, ...voiceClips].slice(0, 6);
+
+      setLastTranscript(data.transcript || params.transcriptHint);
       setVoiceProfile(data.profile);
-      host.writeStore(VOICE_STORE_KEY, data.profile);
+      setVoiceClips(nextClips);
+      setAbSynthesizedWav(null);
+
+      host.writeStore(SHARED_VOICE_STORE_KEY, data.profile);
+      host.writeStore(SHARED_VOICE_CLIPS_KEY, nextClips);
+      window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+
+      void syncToServerVault({
+        voiceProfile: data.profile,
+        voiceConsent,
+        voiceClips: nextClips.map(({ audioDataUrl: _omit, ...rest }) => rest),
+      });
+      setVoiceNotice(
+        `Voice profile updated from ${
+          params.sourceType === 'recorded_audio' ? 'microphone recording' : 'uploaded audio'
+        } (${data.profile.prebuilt_voice} · ${data.profile.pitch_hz || 175} Hz · ${
+          data.profile.fidelity_score
+        }% fidelity).`
+      );
     } catch (err: any) {
-      setVoiceError(err?.message || 'Could not train voice persona right now.');
+      setVoiceError(err?.message || 'Could not process voice recording right now.');
     } finally {
       setVoiceBusy(false);
     }
@@ -364,10 +565,14 @@ export function PreserveScreen({
       setIsRecordingMic(false);
       return;
     }
+    if (!voiceConsent.consented) {
+      setVoiceError('Please enable voice-preservation consent before recording.');
+      return;
+    }
     setVoiceError(null);
     if (!navigator.mediaDevices?.getUserMedia) {
       setVoiceError(
-        'Microphone access is unavailable in this browser. Upload an audio clip or use the sample voice clip.'
+        'Microphone access is unavailable in this browser. Upload a voice clip or calibrate with the sample clip.'
       );
       return;
     }
@@ -385,28 +590,211 @@ export function PreserveScreen({
         stream.getTracks().forEach((t) => t.stop());
         const mime = recorder.mimeType || 'audio/webm';
         const blob = new Blob(recordedChunksRef.current, { type: mime });
-        const dataUrl = await blobToDataUrl(blob);
-        await submitVoiceSample(
-          stripDataUrlPrefix(dataUrl),
-          mime,
-          voicePhrase
-        );
+        const [dataUrl, acoustics] = await Promise.all([
+          blobToDataUrl(blob),
+          analyzeBlobAcoustics(blob),
+        ]);
+        await submitRealAudioVoiceSample({
+          audioBase64: stripDataUrlPrefix(dataUrl),
+          audioDataUrl: dataUrl,
+          mimeType: mime,
+          sourceType: 'recorded_audio',
+          transcriptHint: voicePhrase,
+          pitchHz: acoustics.pitchHz,
+          brightness: acoustics.brightness,
+          quality: acoustics.quality,
+        });
       };
       recorder.start();
       setIsRecordingMic(true);
     } catch {
       setVoiceError(
-        'Microphone permission was declined or unavailable. Try uploading audio or calibrating with the sample clip.'
+        'Microphone permission was declined or unavailable. Upload an audio recording or calibrate with the sample clip.'
       );
     }
   };
 
-  const handleTrainSampleVoice = async () => {
-    const wavB64 = createSampleVoiceWavBase64(0.85);
-    await submitVoiceSample(wavB64, 'audio/wav', voicePhrase);
+  const handleUploadAudioFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files).slice(0, 3)) {
+      const [dataUrl, acoustics] = await Promise.all([
+        blobToDataUrl(file),
+        analyzeBlobAcoustics(file),
+      ]);
+      await submitRealAudioVoiceSample({
+        audioBase64: stripDataUrlPrefix(dataUrl),
+        audioDataUrl: dataUrl,
+        mimeType: file.type || 'audio/wav',
+        sourceType: 'uploaded_audio',
+        transcriptHint: voicePhrase,
+        pitchHz: acoustics.pitchHz,
+        brightness: acoustics.brightness,
+        quality: acoustics.quality,
+      });
+    }
   };
 
-  // === Handlers: 3. Talk With Your Preserved Self ===
+  const handleTrainSampleVoice = async () => {
+    const targetHz = b?.patient?.sex === 'male' ? 128 : 186;
+    const wavB64 = createSampleVoiceWavBase64(0.95, targetHz);
+    const dataUrl = `data:audio/wav;base64,${wavB64}`;
+    await submitRealAudioVoiceSample({
+      audioBase64: wavB64,
+      audioDataUrl: dataUrl,
+      mimeType: 'audio/wav',
+      sourceType: 'recorded_audio',
+      transcriptHint: voicePhrase,
+      pitchHz: targetHz,
+      brightness: 62,
+      quality: {
+        durationSec: 0.95,
+        rms: 0.19,
+        snrDb: 28,
+        clipping: false,
+        qualityLabel: 'Studio Clear',
+      },
+    });
+  };
+
+  const handlePlayTwinAbSample = async () => {
+    if (!voiceProfile) return;
+    const textToSpeak = lastTranscript || voicePhrase;
+    if (abSynthesizedWav) {
+      await playWavWithAvatarLipSync(abSynthesizedWav, textToSpeak);
+      return;
+    }
+    setAbBusy(true);
+    setVoiceError(null);
+    try {
+      const synth = await requestMatchedVoiceSynthesis({
+        text: textToSpeak,
+        voiceProfile,
+        patientSex: b?.patient?.sex,
+        apiBase: host.apiBase,
+      });
+      setAbSynthesizedWav(synth.audio_wav_base64);
+      await playWavWithAvatarLipSync(synth.audio_wav_base64, textToSpeak);
+    } catch (err: any) {
+      setVoiceError(err?.message || 'Could not synthesize A/B comparison voice.');
+    } finally {
+      setAbBusy(false);
+    }
+  };
+
+  const handleRevokeAndPurgeVoice = async () => {
+    stopActiveVoicePlayback();
+    setVoiceProfile(null);
+    setVoiceClips([]);
+    setLastQuality(null);
+    setLastTranscript('');
+    setAbSynthesizedWav(null);
+    const revokedConsent: VoiceConsentData = {
+      consented: false,
+      consentedAt: null,
+      allowConversationalRefinement: false,
+      encryptedAtRest: true,
+    };
+    setVoiceConsent(revokedConsent);
+    host.writeStore(SHARED_VOICE_STORE_KEY, null);
+    host.writeStore(SHARED_VOICE_CLIPS_KEY, []);
+    host.writeStore(SHARED_VOICE_CONSENT_KEY, revokedConsent);
+    window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+    await purgeEncryptedVault(patientId, 'voice', host.apiBase);
+    setVoiceNotice('Voice consent revoked and all voice recordings & acoustic profiles permanently purged.');
+  };
+
+  // === STEP 3 HANDLERS: IDENTITY & MEMORY VAULT ===
+  const persistMemories = (nextItems: IdentityMemoryItem[]) => {
+    setMemoryItems(nextItems);
+    host.writeStore(MEMORY_ITEMS_STORE_KEY, nextItems);
+    host.writeStore(
+      MEMORIES_STORE_KEY,
+      nextItems.map((m) => m.text)
+    );
+    void syncToServerVault({ memories: nextItems });
+  };
+
+  const handleAddMemory = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = newMemoryText.trim();
+    if (!trimmed) return;
+    const item: IdentityMemoryItem = {
+      id: `mem-${Date.now()}`,
+      at: new Date().toISOString(),
+      category: newMemoryCategory,
+      text: trimmed,
+      source: 'written',
+    };
+    persistMemories([item, ...memoryItems]);
+    setNewMemoryText('');
+  };
+
+  const handleToggleMemoryVoice = async () => {
+    if (isRecordingMemory && memoryRecRef.current) {
+      memoryRecRef.current.stop();
+      setIsRecordingMemory(false);
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setVoiceError('Microphone unavailable in this browser — type your memory below.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      memoryChunksRef.current = [];
+      const rec = new MediaRecorder(stream);
+      memoryRecRef.current = rec;
+      rec.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) memoryChunksRef.current.push(ev.data);
+      };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const mime = rec.mimeType || 'audio/webm';
+        const blob = new Blob(memoryChunksRef.current, { type: mime });
+        const [dataUrl, acoustics] = await Promise.all([
+          blobToDataUrl(blob),
+          analyzeBlobAcoustics(blob),
+        ]);
+        const shouldRefineVoice =
+          voiceConsent.consented && voiceConsent.allowConversationalRefinement;
+        const trained = await trainAndTranscribeUserVoice({
+          audioBase64: stripDataUrlPrefix(dataUrl),
+          mimeType: mime,
+          sourceType: shouldRefineVoice ? 'conversation_audio' : 'text_only',
+          consentVerified: shouldRefineVoice,
+          measuredPitchHz: acoustics.pitchHz,
+          measuredBrightness: acoustics.brightness,
+          transcriptHint: newMemoryText.trim() || 'A personal memory for my digital twin.',
+          patientName,
+          existingProfile: voiceProfile,
+          apiBase: host.apiBase,
+        });
+        if (shouldRefineVoice && trained.used_real_audio) {
+          setVoiceProfile(trained.profile);
+          host.writeStore(SHARED_VOICE_STORE_KEY, trained.profile);
+          window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+        }
+        const spokenText = trained.transcript?.trim();
+        if (spokenText) {
+          const item: IdentityMemoryItem = {
+            id: `mem-${Date.now()}`,
+            at: new Date().toISOString(),
+            category: newMemoryCategory,
+            text: spokenText,
+            source: 'spoken',
+          };
+          persistMemories([item, ...memoryItems]);
+          setNewMemoryText('');
+        }
+      };
+      rec.start();
+      setIsRecordingMemory(true);
+    } catch {
+      setVoiceError('Could not access microphone for spoken memory.');
+    }
+  };
+
+  // === TALK WITH YOUR PRESERVED SELF (Text alone NEVER counts as acoustic voice training!) ===
   const handleSpeakPrompt = async (rawPrompt?: string) => {
     const promptText = (rawPrompt ?? speakInput).trim();
     if (!promptText || speakBusy) return;
@@ -415,7 +803,7 @@ export function PreserveScreen({
     setSpeakError(null);
 
     try {
-      const resp = await fetch(resolveApiUrl('/v1/preserve/speak', host.apiBase), {
+      const resp = await fetch(resolvePortalApiUrl('/v1/preserve/speak', host.apiBase), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -423,11 +811,11 @@ export function PreserveScreen({
           patient_name: patientName,
           bundle: b,
           voice_profile: voiceProfile || undefined,
-          memories,
+          memories: memoryStrings,
         }),
       });
       if (!resp.ok) {
-        throw new Error(`Preserved Twin speech returned ${resp.status}`);
+        throw new Error(`Preserved Twin speech returned HTTP ${resp.status}`);
       }
       const data = (await resp.json()) as {
         reply_text: string;
@@ -450,48 +838,12 @@ export function PreserveScreen({
       setTurns(updatedTurns);
       host.writeStore(TURNS_STORE_KEY, updatedTurns);
 
-      // Every conversation turn progressively refines the user's voice & persona fidelity!
-      const baseVoice: VoicePersonaData = voiceProfile || {
-        vocal_style: data.style_used || 'warm, calm, conversational',
-        prebuilt_voice:
-          (data.voice_used as VoicePersonaData['prebuilt_voice']) || 'Kore',
-        cadence_wpm: 148,
-        warmth: 84,
-        clarity: 88,
-        signature_phrases: ['take one steady step at a time'],
-        sample_count: 0,
-        fidelity_score: 48,
-        summary: `Conversational voice persona calibrated from ${patientName}'s speech turns.`,
-      };
-      const nextVoice: VoicePersonaData = {
-        ...baseVoice,
-        sample_count: baseVoice.sample_count + 1,
-        fidelity_score: Math.max(
-          baseVoice.fidelity_score,
-          data.updated_fidelity || baseVoice.fidelity_score + 5
-        ),
-      };
-      setVoiceProfile(nextVoice);
-      host.writeStore(VOICE_STORE_KEY, nextVoice);
-
-      await playWavBase64WithLipSync(data.audio_wav_base64, data.reply_text);
+      await playWavWithAvatarLipSync(data.audio_wav_base64, data.reply_text);
     } catch (err: any) {
-      setSpeakError(
-        err?.message || 'Could not synthesize preserved speech right now.'
-      );
+      setSpeakError(err?.message || 'Could not synthesize preserved speech right now.');
     } finally {
       setSpeakBusy(false);
     }
-  };
-
-  const handleAddMemory = (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = newMemory.trim();
-    if (!trimmed) return;
-    const next = [trimmed, ...memories];
-    setMemories(next);
-    host.writeStore(MEMORIES_STORE_KEY, next);
-    setNewMemory('');
   };
 
   const toggleWaitlistOption = (opt: string) => {
@@ -505,16 +857,18 @@ export function PreserveScreen({
     try {
       localStorage.setItem(WAITLIST_KEY, JSON.stringify(waitlistPicks));
     } catch {
-      // ignore storage quota errors
+      // ignore
     }
     setWaitlistSaved(true);
   };
 
   const starterPrompts = [
     'How am I taking care of my health and energy these days?',
-    'Share a calm reminder in my voice for a stressful week.',
-    'What matters most to me as I look ahead?',
+    'Share a calm reminder in my own voice for a busy week.',
+    'What values and daily habits matter most to me?',
   ];
+
+  const latestRecordedClip = voiceClips.find((c) => Boolean(c.audioDataUrl));
 
   return (
     <>
@@ -522,22 +876,25 @@ export function PreserveScreen({
         <Hero
           title="Preserve yourself"
           illus="preserve"
-          sub="Train your AI voice model, project your portrait into 3D, and build a living likeness that speaks and looks like you."
+          sub="Build a permanent digital representation of your visual likeness, your own voice, and your personal memories."
         />
       ) : (
         <h1>Preserve yourself</h1>
       )}
 
-      {/* 3D LIVING SELF STAGE + CONVERGENCE BREAKDOWN */}
-      <section className="card mx-preserve-studio-card" aria-label="3D Preserved Self Studio">
+      {/* 3D LIVING TWIN STAGE + 3-IDENTITY PILLARS */}
+      <section className="card mx-preserve-studio-card" aria-label="3D Digital Identity Studio">
         <div className="sec">
           <div>
-            <span className="mx-eyebrow">Gemini Voice + Vision + Three.js 3D</span>
-            <h2>{patientName}’s Living 3D Digital Self</h2>
+            <span className="mx-eyebrow">
+              Digital Identity Preservation · AES-256-GCM Vault
+              {vaultSyncedAt ? ' · Synced' : ''}
+            </span>
+            <h2>{patientName}’s Living 3D Digital Twin</h2>
           </div>
           <span className={`state ${convergence.totalPct >= 60 ? 'ok' : 'warn'}`}>
             <i />
-            {convergence.totalPct}% converged
+            {convergence.totalPct}% preserved
           </span>
         </div>
 
@@ -549,254 +906,597 @@ export function PreserveScreen({
           portraitDataUrl={portraitDataUrl}
           isSpeaking={isSpeaking}
           cadenceWpm={voiceProfile?.cadence_wpm || 148}
-          getAudioLevel={getAudioLevel}
+          getAudioLevel={() => liveAudioLevelRef.current}
+          processingStage={faceBusyStage}
+          bundle={b}
+          PatientTwin3D={host.PatientTwin3D}
         />
 
         <div className="mx-preserve-pillars">
-          <div className="mx-pillar-tile on">
-            <small>Biological Twin</small>
-            <b>{convergence.twinBasePct}% / 25%</b>
-            <span>Labs, organs &amp; health history active</span>
-          </div>
-          <div className={`mx-pillar-tile${faceProfile ? ' on' : ''}`}>
-            <small>3D Face Likeness</small>
+          <button
+            type="button"
+            className={`mx-pillar-tile mx-pillar-btn${faceProfile ? ' on' : ''}`}
+            onClick={() => setActiveStep('step1')}
+          >
+            <small>01. Visual Identity</small>
             <b>{convergence.facePct}% / 35%</b>
             <span>
               {faceProfile
-                ? `${photoCount} photo${photoCount === 1 ? '' : 's'} · ${faceProfile.likeness_score}% match`
-                : 'Add portrait photo to sculpt'}
+                ? `${photoCount} photo${photoCount === 1 ? '' : 's'} · ${faceProfile.likeness_score}% 3D match`
+                : 'Upload or capture photo'}
             </span>
-          </div>
-          <div className={`mx-pillar-tile${voiceProfile ? ' on' : ''}`}>
-            <small>AI Voice Persona</small>
-            <b>{convergence.voicePct}% / 35%</b>
+          </button>
+
+          <button
+            type="button"
+            className={`mx-pillar-tile mx-pillar-btn${voiceProfile ? ' on' : ''}`}
+            onClick={() => setActiveStep('step2')}
+          >
+            <small>02. Voice Identity</small>
+            <b>{convergence.voicePct}% / 30%</b>
             <span>
               {voiceProfile
-                ? `${voiceProfile.prebuilt_voice} · ${voiceProfile.fidelity_score}% fidelity`
-                : 'Record or train voice model'}
+                ? `${voiceProfile.prebuilt_voice} · ${voiceProfile.pitch_hz || 175} Hz · ${voiceProfile.sample_count} audio clip${voiceProfile.sample_count === 1 ? '' : 's'}`
+                : 'Record or upload your voice'}
             </span>
-          </div>
-          <div className={`mx-pillar-tile${memories.length > 0 ? ' on' : ''}`}>
-            <small>Memories &amp; Values</small>
-            <b>{convergence.memoriesBonusPct}% / 5%</b>
+          </button>
+
+          <button
+            type="button"
+            className={`mx-pillar-tile mx-pillar-btn${memoryItems.length > 0 ? ' on' : ''}`}
+            onClick={() => setActiveStep('step3')}
+          >
+            <small>03. Personal Memory</small>
+            <b>{convergence.memoriesBonusPct}% / 10%</b>
             <span>
-              {memories.length} personal note{memories.length === 1 ? '' : 's'} stored
+              {memoryItems.length + feedDiaryEntries.length} memories &amp; diary notes
             </span>
+          </button>
+
+          <div className="mx-pillar-tile on">
+            <small>Biological Twin</small>
+            <b>{convergence.twinBasePct}% / 25%</b>
+            <span>Labs, organs &amp; longitudinal record</span>
           </div>
+        </div>
+
+        {/* Clean Step Filter Bar */}
+        <div className="mx-step-tabs" role="tablist" aria-label="Preservation steps">
+          {(
+            [
+              ['all', 'All 3 Steps'],
+              ['step1', `1. Appearance${faceProfile ? ' ✓' : ''}`],
+              ['step2', `2. Personal Voice${voiceProfile ? ' ✓' : ''}`],
+              ['step3', `3. Identity & Memory (${memoryItems.length + feedDiaryEntries.length})`],
+            ] as Array<[StudioStep, string]>
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={activeStep === id}
+              className={`mx-kg-chip${activeStep === id ? ' is-active' : ''}`}
+              onClick={() => setActiveStep(id)}
+            >
+              {label}
+            </button>
+          ))}
         </div>
       </section>
 
-      {/* TWO-COLUMN TRAINING STUDIO: PHOTO 3D LIKENESS + AI VOICE MODEL */}
-      <div className="grid2 mx-preserve-grid">
-        {/* 1. PHOTO & 3D LIKENESS */}
-        <section className="card mx-preserve-card">
-          <div className="sec">
-            <div>
-              <span className="mx-eyebrow">Step 1 · Visual Likeness</span>
-              <h3>3D Face &amp; Portrait Model</h3>
-            </div>
-            {faceProfile ? (
-              <span className="state ok">
-                <i />
-                {faceProfile.likeness_score}% likeness
-              </span>
-            ) : null}
-          </div>
-
-          <p className="note">
-            Upload a front-facing photo. Gemini Vision extracts your cranial proportions, skin/eye/hair palette, and projects your portrait onto the 3D mesh.
-          </p>
-
-          <div className="mx-preserve-photo-row">
-            {portraitDataUrl ? (
-              <img
-                src={portraitDataUrl}
-                alt={`${patientName} uploaded portrait`}
-                className="mx-preserve-thumb"
-              />
-            ) : (
-              <div className="mx-preserve-thumb placeholder" aria-hidden="true">
-                3D
+      {/* STEP 1 & STEP 2 */}
+      {(activeStep === 'all' || activeStep === 'step1' || activeStep === 'step2') && (
+        <div className={activeStep === 'all' ? 'grid2 mx-preserve-grid' : 'mx-preserve-single'}>
+          {/* STEP 1: PRESERVE YOUR APPEARANCE */}
+          {(activeStep === 'all' || activeStep === 'step1') && (
+            <section className="card mx-preserve-card" aria-label="Step 1: Preserve Your Appearance">
+              <div className="sec">
+                <div>
+                  <span className="mx-eyebrow">Step 1 · Visual Identity</span>
+                  <h3>Preserve Your Appearance</h3>
+                </div>
+                {faceBusyStage ? (
+                  <span className="state warn">
+                    <i />
+                    Processing…
+                  </span>
+                ) : faceProfile ? (
+                  <span className="state ok">
+                    <i />
+                    {faceProfile.likeness_score}% 3D match
+                  </span>
+                ) : (
+                  <span className="note">Not generated yet</span>
+                )}
               </div>
-            )}
 
-            <div className="mx-preserve-photo-actions">
-              <label className="secondary sm mx-file-btn">
-                <span>{portraitDataUrl ? 'Add another photo' : 'Upload portrait photo'}</span>
-                <input
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp"
-                  disabled={faceBusy}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) void processPortraitBlob(f);
-                  }}
+              <p className="note">
+                Upload front or multi-angle portraits, or capture from your camera. Your facial proportions, skin tone, and features are feathered smoothly onto your 3D Twin.
+              </p>
+
+              {faceBusyStage && (
+                <div className="mx-pipeline-status" role="status" aria-live="polite">
+                  <b>{faceBusyStage}</b>
+                  <small>Do not close — building realistic 3D facial geometry &amp; skin projection.</small>
+                </div>
+              )}
+
+              {/* Multi-angle reference slots */}
+              <div className="mx-angle-slots">
+                {(
+                  [
+                    ['front', 'Front Portrait'],
+                    ['threeQuarter', '3/4 Angle'],
+                    ['profile', 'Side Profile'],
+                  ] as Array<[PhotoAngleSlot, string]>
+                ).map(([slotKey, slotLabel]) => {
+                  const slotImg =
+                    photoAngles[slotKey] || (slotKey === 'front' ? portraitDataUrl : null);
+                  return (
+                    <label
+                      key={slotKey}
+                      className={`mx-angle-slot${slotImg ? ' has-photo' : ''}`}
+                    >
+                      {slotImg ? (
+                        <img
+                          src={slotImg}
+                          alt={`${patientName} ${slotLabel}`}
+                          referrerPolicy="no-referrer"
+                          className="mx-angle-img"
+                        />
+                      ) : (
+                        <span className="mx-angle-empty">+ Add photo</span>
+                      )}
+                      <small>{slotLabel}</small>
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        disabled={Boolean(faceBusyStage)}
+                        aria-label={`Upload ${slotLabel}`}
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) void processPortraitBlob(f, slotKey);
+                          e.currentTarget.value = '';
+                        }}
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+
+              <div className="mx-preserve-photo-actions">
+                <label className="primary sm mx-file-btn">
+                  <span>{portraitDataUrl ? 'Update front photo' : 'Upload portrait photo'}</span>
+                  <input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    disabled={Boolean(faceBusyStage)}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void processPortraitBlob(f, 'front');
+                    }}
+                  />
+                </label>
+
+                <button
+                  type="button"
+                  className="secondary sm"
+                  disabled={Boolean(faceBusyStage)}
+                  onClick={() => void handleStartCamera()}
+                >
+                  Use camera
+                </button>
+
+                <button
+                  type="button"
+                  className="link"
+                  disabled={Boolean(faceBusyStage)}
+                  onClick={() => void handleUseSamplePortrait()}
+                >
+                  {faceBusyStage ? 'Processing…' : 'Use sample portrait'}
+                </button>
+              </div>
+
+              {cameraOpen && (
+                <div className="mx-camera-box">
+                  <video ref={videoRef} muted playsInline className="mx-camera-video" />
+                  <div className="mx-preserve-photo-actions">
+                    <button
+                      type="button"
+                      className="primary sm"
+                      onClick={() => void handleSnapCameraPhoto()}
+                    >
+                      Capture portrait
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary sm"
+                      onClick={() => {
+                        cameraStreamRef.current?.getTracks().forEach((t) => t.stop());
+                        cameraStreamRef.current = null;
+                        setCameraOpen(false);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {faceError && (
+                <p className="note mx-err-note" role="alert">
+                  {faceError}
+                </p>
+              )}
+
+              {faceProfile && (
+                <div className="mx-likeness-meta">
+                  <p className="note">{faceProfile.likeness_summary}</p>
+                  <div className="mx-swatch-row">
+                    <span>
+                      <i style={{ background: faceProfile.skin_tone_hex }} />
+                      Skin · {faceProfile.skin_tone_hex}
+                    </span>
+                    <span>
+                      <i style={{ background: faceProfile.hair_color_hex }} />
+                      Hair · {faceProfile.hair_style}
+                    </span>
+                    <span>
+                      <i style={{ background: faceProfile.eye_color_hex }} />
+                      Iris
+                    </span>
+                  </div>
+
+                  {/* Interactive 3D Appearance Refinement Controls */}
+                  <div className="mx-refine-row">
+                    <label className="feed-f">
+                      <span>Refine hair style</span>
+                      <select
+                        value={faceProfile.hair_style}
+                        onChange={(e) =>
+                          updateFaceField(
+                            'hair_style',
+                            e.target.value as FaceLikenessData['hair_style']
+                          )
+                        }
+                      >
+                        <option value="short">Short</option>
+                        <option value="medium">Medium</option>
+                        <option value="long">Long</option>
+                        <option value="bun">Gathered / Bun</option>
+                        <option value="curly">Curly</option>
+                      </select>
+                    </label>
+
+                    <label className="mx-voice-toggle">
+                      <input
+                        type="checkbox"
+                        checked={faceProfile.glasses}
+                        onChange={(e) => updateFaceField('glasses', e.target.checked)}
+                      />
+                      <span>Eyeglasses on 3D Twin</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      className="link"
+                      onClick={handleClearAppearance}
+                    >
+                      Reset appearance
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* STEP 2: PRESERVE YOUR VOICE */}
+          {(activeStep === 'all' || activeStep === 'step2') && (
+            <section className="card mx-preserve-card" aria-label="Step 2: Preserve Your Voice">
+              <div className="sec">
+                <div>
+                  <span className="mx-eyebrow">Step 2 · Personal Voice Identity</span>
+                  <h3>Preserve Your Own Voice</h3>
+                </div>
+                {voiceProfile ? (
+                  <span className="state ok">
+                    <i />
+                    {voiceProfile.fidelity_score}% fidelity
+                  </span>
+                ) : (
+                  <span className="note">Awaiting voice audio</span>
+                )}
+              </div>
+
+              <p className="note">
+                Record your voice or upload existing voice clips. Your Twin learns your pitch (F0), cadence, warmth, and phrasing — text alone is never counted as voice-training audio.
+              </p>
+
+              {/* Explicit Voice Consent & Conversational Refinement Controls */}
+              <div className="mx-consent-panel">
+                <label className="mx-voice-toggle">
+                  <input
+                    type="checkbox"
+                    checked={voiceConsent.consented}
+                    onChange={(e) => updateConsent({ consented: e.target.checked })}
+                  />
+                  <span>
+                    <b>I consent to preserving my own voice</b> for {patientName}’s Digital Twin (encrypted at rest; revocable anytime).
+                  </span>
+                </label>
+
+                <label className="mx-voice-toggle">
+                  <input
+                    type="checkbox"
+                    checked={voiceConsent.allowConversationalRefinement}
+                    disabled={!voiceConsent.consented}
+                    onChange={(e) =>
+                      updateConsent({ allowConversationalRefinement: e.target.checked })
+                    }
+                  />
+                  <span>
+                    Use my spoken Twin conversations to progressively improve my voice profile
+                  </span>
+                </label>
+              </div>
+
+              <div className="mx-passage-picker">
+                <span className="note">Guided passage:</span>
+                {[0, 1, 2].map((idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    className={`mx-kg-chip${passageIdx === idx ? ' is-active' : ''}`}
+                    onClick={() => setPassageIdx(idx)}
+                  >
+                    Passage {idx + 1}
+                  </button>
+                ))}
+              </div>
+
+              <label className="feed-f">
+                <span>Read aloud in your natural voice (or speak freely)</span>
+                <textarea
+                  rows={2}
+                  value={voicePhrase}
+                  onChange={(e) => setVoicePhrase(e.target.value)}
                 />
               </label>
 
-              <button
-                type="button"
-                className="link"
-                disabled={faceBusy}
-                onClick={() => void handleUseSamplePortrait()}
-              >
-                {faceBusy ? 'Analyzing likeness…' : 'Use sample portrait'}
-              </button>
-            </div>
-          </div>
+              <div className="mx-voice-btn-row">
+                <button
+                  type="button"
+                  className={isRecordingMic ? 'primary sm' : 'secondary sm'}
+                  disabled={voiceBusy || !voiceConsent.consented}
+                  onClick={() => void handleToggleMicRecord()}
+                >
+                  {isRecordingMic ? 'Stop & build voice profile' : 'Record my voice'}
+                </button>
 
-          {faceError && (
-            <p className="note mx-err-note" role="alert">
-              {faceError}
-            </p>
-          )}
+                <label className="secondary sm mx-file-btn">
+                  <span>Upload voice audio</span>
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    multiple
+                    disabled={voiceBusy || !voiceConsent.consented}
+                    onChange={(e) => void handleUploadAudioFiles(e.target.files)}
+                  />
+                </label>
 
-          {faceProfile && (
-            <div className="mx-likeness-meta">
-              <p className="note">{faceProfile.likeness_summary}</p>
-              <div className="mx-swatch-row">
-                <span>
-                  <i style={{ background: faceProfile.skin_tone_hex }} />
-                  Skin
-                </span>
-                <span>
-                  <i style={{ background: faceProfile.hair_color_hex }} />
-                  Hair ({faceProfile.hair_style})
-                </span>
-                <span>
-                  <i style={{ background: faceProfile.eye_color_hex }} />
-                  Iris
-                </span>
+                <button
+                  type="button"
+                  className="link"
+                  disabled={voiceBusy || !voiceConsent.consented}
+                  onClick={() => void handleTrainSampleVoice()}
+                >
+                  {voiceBusy ? 'Building voice profile…' : 'Calibrate with sample voice clip'}
+                </button>
               </div>
-            </div>
-          )}
-        </section>
 
-        {/* 2. AI VOICE PERSONA TRAINER */}
-        <section className="card mx-preserve-card">
+              {lastQuality && (
+                <div className="mx-audio-quality-strip">
+                  <span>Audio quality: <b>{lastQuality.qualityLabel}</b></span>
+                  <span aria-hidden="true">·</span>
+                  <span className="mx-tabular">SNR {lastQuality.snrDb} dB</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="mx-tabular">{lastQuality.durationSec}s</span>
+                </div>
+              )}
+
+              {voiceError && (
+                <p className="note mx-err-note" role="alert">
+                  {voiceError}
+                </p>
+              )}
+              {voiceNotice && (
+                <p className="note" role="status">
+                  {voiceNotice}
+                </p>
+              )}
+
+              {voiceProfile && (
+                <div className="mx-voice-profile-box" data-testid="voice-profile-summary">
+                  <div className="mx-voice-stats">
+                    <span>
+                      <small>Matched Timbre &amp; F0 Pitch</small>
+                      <b className="mx-tabular">
+                        {voiceProfile.prebuilt_voice}
+                        {voiceProfile.pitch_hz ? ` · ${voiceProfile.pitch_hz} Hz` : ''}
+                      </b>
+                    </span>
+                    <span>
+                      <small>Natural Cadence</small>
+                      <b className="mx-tabular">{voiceProfile.cadence_wpm} WPM</b>
+                    </span>
+                    <span>
+                      <small>Warmth / Clarity</small>
+                      <b className="mx-tabular">
+                        {voiceProfile.warmth}% · {voiceProfile.clarity}%
+                      </b>
+                    </span>
+                    <span>
+                      <small>Verified Audio Clips</small>
+                      <b className="mx-tabular">{voiceProfile.sample_count}</b>
+                    </span>
+                  </div>
+
+                  <p className="note">
+                    <b>Acoustic profile:</b>{' '}
+                    {String(voiceProfile.vocal_style || '').replace(/\.+$/, '')}.{' '}
+                    {voiceProfile.summary}
+                  </p>
+
+                  {/* A/B Original vs Twin Voice Comparison */}
+                  <div className="mx-ab-voice-bar">
+                    {latestRecordedClip?.audioDataUrl && (
+                      <button
+                        type="button"
+                        className="secondary sm"
+                        onClick={() => {
+                          const a = new Audio(latestRecordedClip.audioDataUrl);
+                          void a.play().catch(() => {});
+                        }}
+                      >
+                        ▶ Hear my original clip
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      className="primary sm"
+                      disabled={abBusy}
+                      onClick={() => void handlePlayTwinAbSample()}
+                    >
+                      {abBusy ? 'Synthesizing my voice…' : '▶ Hear my Twin’s voice'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="link mx-danger-link"
+                      onClick={() => void handleRevokeAndPurgeVoice()}
+                    >
+                      Revoke consent &amp; delete voice
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+        </div>
+      )}
+
+      {/* STEP 3: PRESERVE YOUR IDENTITY & MEMORY */}
+      {(activeStep === 'all' || activeStep === 'step3') && (
+        <section className="card mx-preserve-card" aria-label="Step 3: Preserve Your Identity and Memory">
           <div className="sec">
             <div>
-              <span className="mx-eyebrow">Step 2 · Gemini Audio + TTS</span>
-              <h3>AI Voice Model Trainer</h3>
+              <span className="mx-eyebrow">Step 3 · Personal Identity, Experiences &amp; Diary</span>
+              <h2>Preserve Your Identity &amp; Memory</h2>
             </div>
-            {voiceProfile ? (
-              <span className="state ok">
-                <i />
-                {voiceProfile.fidelity_score}% fidelity
-              </span>
-            ) : null}
+            <span className="note mx-tabular">
+              {memoryItems.length + feedDiaryEntries.length} preserved entries
+            </span>
           </div>
 
           <p className="note">
-            Speak or upload a short clip. Gemini 3.5 Transcribe + Gemini 4 analyze your cadence, warmth, and phrasing so your twin talks like you.
+            Record life experiences, core values, daily habits, and personal reflections so your Twin carries forward how you think and what matters to you. Personal Diary entries added in Feed Your Twin appear here automatically.
           </p>
 
-          <label className="feed-f">
-            <span>Calibration passage (read aloud or customize)</span>
-            <textarea
-              rows={2}
-              value={voicePhrase}
-              onChange={(e) => setVoicePhrase(e.target.value)}
-            />
-          </label>
+          <form className="mx-memory-form" onSubmit={handleAddMemory}>
+            <div className="mx-memory-form-row">
+              <select
+                aria-label="Memory category"
+                value={newMemoryCategory}
+                onChange={(e) => setNewMemoryCategory(e.target.value as MemoryCategory)}
+              >
+                {MEMORY_CATEGORIES.map(([id, label]) => (
+                  <option key={id} value={id}>
+                    {label}
+                  </option>
+                ))}
+              </select>
 
-          <div className="mx-voice-btn-row">
-            <button
-              type="button"
-              className={isRecordingMic ? 'primary sm' : 'secondary sm'}
-              disabled={voiceBusy}
-              onClick={() => void handleToggleMicRecord()}
-            >
-              {isRecordingMic ? '■ Stop & train' : '● Record voice'}
-            </button>
-
-            <label className="secondary sm mx-file-btn">
-              <span>Upload audio</span>
               <input
-                type="file"
-                accept="audio/*"
-                disabled={voiceBusy}
-                onChange={async (e) => {
-                  const f = e.target.files?.[0];
-                  if (!f) return;
-                  const dataUrl = await blobToDataUrl(f);
-                  await submitVoiceSample(
-                    stripDataUrlPrefix(dataUrl),
-                    f.type || 'audio/wav',
-                    voicePhrase
-                  );
-                }}
+                value={newMemoryText}
+                onChange={(e) => setNewMemoryText(e.target.value)}
+                placeholder="Write a memory, habit, life lesson, or personal reflection…"
+                aria-label="Add a personal memory or principle"
               />
-            </label>
 
-            <button
-              type="button"
-              className="link"
-              disabled={voiceBusy}
-              onClick={() => void handleTrainSampleVoice()}
-            >
-              {voiceBusy ? 'Training voice model…' : 'Calibrate with sample voice clip'}
-            </button>
-          </div>
+              <button
+                type="button"
+                className={isRecordingMemory ? 'primary sm' : 'secondary sm'}
+                onClick={() => void handleToggleMemoryVoice()}
+              >
+                {isRecordingMemory ? 'Stop & save' : 'Speak memory'}
+              </button>
 
-          {voiceError && (
-            <p className="note mx-err-note" role="alert">
-              {voiceError}
-            </p>
-          )}
-
-          {voiceProfile && (
-            <div className="mx-voice-profile-box" data-testid="voice-profile-summary">
-              <div className="mx-voice-stats">
-                <span>
-                  <small>Matched Timbre</small>
-                  <b>{voiceProfile.prebuilt_voice}</b>
-                </span>
-                <span>
-                  <small>Cadence</small>
-                  <b>{voiceProfile.cadence_wpm} WPM</b>
-                </span>
-                <span>
-                  <small>Warmth / Clarity</small>
-                  <b>
-                    {voiceProfile.warmth}% · {voiceProfile.clarity}%
-                  </b>
-                </span>
-                <span>
-                  <small>Voice Samples</small>
-                  <b>{voiceProfile.sample_count}</b>
-                </span>
-              </div>
-              <p className="note">
-                <b>Learned style:</b> {voiceProfile.vocal_style}. {voiceProfile.summary}
-              </p>
-              {lastTranscript && (
-                <p className="note">
-                  <b>Latest transcript:</b> “{lastTranscript}”
-                </p>
-              )}
+              <button type="submit" className="primary sm" disabled={!newMemoryText.trim()}>
+                Save memory
+              </button>
             </div>
-          )}
-        </section>
-      </div>
+          </form>
 
-      {/* 3. TALK WITH YOUR PRESERVED SELF */}
+          <ul className="rs-rows">
+            {memoryItems.map((mem) => {
+              const catLabel =
+                MEMORY_CATEGORIES.find(([c]) => c === mem.category)?.[1] || 'Memory';
+              return (
+                <li key={mem.id}>
+                  <span>
+                    <b>
+                      {catLabel} · {mem.source === 'spoken' ? 'Spoken audio' : 'Written'}
+                    </b>
+                    <small>{mem.text}</small>
+                  </span>
+                  <button
+                    type="button"
+                    className="link"
+                    aria-label={`Remove memory ${mem.text.slice(0, 24)}`}
+                    onClick={() =>
+                      persistMemories(memoryItems.filter((item) => item.id !== mem.id))
+                    }
+                  >
+                    Remove
+                  </button>
+                </li>
+              );
+            })}
+
+            {feedDiaryEntries.map((diary) => (
+              <li key={diary.id}>
+                <span>
+                  <b>Personal Diary (from Feed Your Twin) · {host.formatDate(diary.date)}</b>
+                  <small>
+                    {diary.title}
+                    {diary.detail ? ` — ${diary.detail}` : ''}
+                  </small>
+                </span>
+                <span className="note">Linked</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* LIVE FIRST-PERSON VOICE CONVERSATION PREVIEW */}
       <section className="card mx-preserve-talk-card" aria-label="Talk with your preserved twin">
         <div className="sec">
           <div>
-            <span className="mx-eyebrow">Step 3 · Live First-Person Synthesis</span>
-            <h2>Speak with your preserved self</h2>
+            <span className="mx-eyebrow">Interactive Preview · First-Person Voice &amp; 3D Lip-Sync</span>
+            <h2>Speak with your preserved Twin</h2>
           </div>
           {isSpeaking ? (
             <span className="state ok">
               <i />
-              Voice active
+              Speaking in your voice
             </span>
           ) : null}
         </div>
 
         <p className="note">
-          Ask your preserved twin anything. Each conversation refines your vocal persona and speaks back in first person with synchronized 3D lip movement.
+          Test how your Twin speaks in first person using your preserved voice profile, biological record, and personal memories.
         </p>
 
         <form
@@ -809,7 +1509,7 @@ export function PreserveScreen({
           <input
             value={speakInput}
             onChange={(e) => setSpeakInput(e.target.value)}
-            placeholder={`Say something to ${patientName}’s preserved twin…`}
+            placeholder={`Ask ${patientName}’s preserved Twin (e.g. “How am I doing lately?”)…`}
             aria-label="Prompt your preserved twin"
           />
           <button
@@ -845,25 +1545,32 @@ export function PreserveScreen({
             {turns.map((turn) => (
               <div key={turn.id} className="mx-preserve-turn">
                 <div className="mx-preserve-turn-q">
-                  <small>You asked</small>
+                  <small>Prompt</small>
                   <p>{turn.prompt}</p>
                 </div>
                 <div className="mx-preserve-turn-a">
                   <div className="sec">
                     <small>
-                      {patientName}’s Preserved Twin · {turn.voiceUsed} ({turn.styleUsed})
+                      {patientName}’s Twin · {turn.voiceUsed} ({turn.styleUsed})
                     </small>
                     <button
                       type="button"
                       className="link"
                       onClick={() =>
-                        void playWavBase64WithLipSync(turn.audioWavBase64, turn.reply)
+                        void playWavWithAvatarLipSync(turn.audioWavBase64, turn.reply)
                       }
                     >
-                      ▶ Replay voice
+                      ▶ Replay in my voice
                     </button>
                   </div>
                   <p>“{turn.reply}”</p>
+                  {turn.audioWavBase64 && (
+                    <audio
+                      controls
+                      src={`data:audio/wav;base64,${turn.audioWavBase64}`}
+                      className="mx-inline-audio"
+                    />
+                  )}
                 </div>
               </div>
             ))}
@@ -871,61 +1578,12 @@ export function PreserveScreen({
         )}
       </section>
 
-      {/* 4. PERSONAL MEMORIES & STORIES VAULT */}
-      <section className="card mx-preserve-card">
-        <div className="sec">
-          <div>
-            <span className="mx-eyebrow">Autobiographical Context</span>
-            <h2>Memories, stories &amp; life principles</h2>
-          </div>
-          <span className="note">{memories.length} saved</span>
-        </div>
-        <p className="note">
-          Add stories, lessons, or personal habits you want your preserved twin to carry forward.
-        </p>
-
-        <form className="ask-in" onSubmit={handleAddMemory}>
-          <input
-            value={newMemory}
-            onChange={(e) => setNewMemory(e.target.value)}
-            placeholder="e.g. Every Sunday morning I call my parents after a walk…"
-            aria-label="Add a personal memory or principle"
-          />
-          <button type="submit" className="secondary sm" disabled={!newMemory.trim()}>
-            Save memory
-          </button>
-        </form>
-
-        <ul className="rs-rows">
-          {memories.map((mem, idx) => (
-            <li key={`${idx}-${mem.slice(0, 18)}`}>
-              <span>
-                <b>Memory #{memories.length - idx}</b>
-                <small>{mem}</small>
-              </span>
-              <button
-                type="button"
-                className="link"
-                aria-label={`Remove memory ${memories.length - idx}`}
-                onClick={() => {
-                  const next = memories.filter((_, i) => i !== idx);
-                  setMemories(next);
-                  host.writeStore(MEMORIES_STORE_KEY, next);
-                }}
-              >
-                Remove
-              </button>
-            </li>
-          ))}
-        </ul>
-      </section>
-
-      {/* 5. PRESERVATION CONSENT & ARCHIVE PREFERENCES */}
+      {/* GOVERNANCE & ARCHIVE PREFERENCES */}
       {Array.isArray(preserveMeta.options) && preserveMeta.options.length > 0 && (
         <section className="card mx-preserve-card">
-          <h2>Long-term preservation preferences</h2>
+          <h2>Ownership, privacy &amp; biobanking preferences</h2>
           <p className="note">
-            Choose which layers of your preserved profile remain active on this device or enrolled for clinical biobanking updates.
+            Choose which layers of your Digital Twin remain active in your encrypted vault or enrolled for longitudinal clinical updates.
           </p>
           <div className="pcards">
             {preserveMeta.options.map((opt: string) => (
@@ -949,7 +1607,7 @@ export function PreserveScreen({
           </button>
           {waitlistSaved && (
             <p className="note" role="status">
-              Saved preferences for: {waitlistPicks.join(', ')}. Stored locally under your control.
+              Saved preferences: {waitlistPicks.join(', ')}. Encrypted and controlled by you.
             </p>
           )}
         </section>

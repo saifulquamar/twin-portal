@@ -1,11 +1,19 @@
 import React, { useState } from 'react';
 import { AskPanel } from './ask';
+import { AuthProvider, usePortalAuth } from './auth-context';
 import { BackButton } from './back-button';
 import { ClinicianBriefingCard } from './clinician-briefing';
 import { FeedScreen } from './feed';
 import { KnowledgeGraphCard } from './kg-graph';
 import { NavigationProvider, usePortalNavigation } from './navigation-context';
 import { OnboardingFlow, ProductTourModal } from './onboarding';
+import {
+  HomeBentoPanel,
+  PatientSwitcherModal,
+  ResearchScreen,
+  YouAccountFooter,
+  YouIdentityBadge,
+} from './portal-views';
 import { PreserveScreen } from './preserve';
 import { SubpageHeader } from './subpage-header';
 
@@ -50,7 +58,15 @@ export function SwitcherExtras({
         <button
           type="button"
           className="secondary sm"
-          onClick={() => navigateHash('#/me/preserve', false)}
+          onClick={() => navigateHash('#/you/checkin:ask', false)}
+        >
+          Ask your twin ("How am I doing?")
+        </button>
+
+        <button
+          type="button"
+          className="secondary sm"
+          onClick={() => navigateHash('#/you/preserve', false)}
         >
           Preserve yourself (3D + Voice)
         </button>
@@ -78,6 +94,8 @@ export function SwitcherExtras({
 }
 
 const portalEnhancements = {
+  AuthProvider,
+  usePortalAuth,
   NavigationProvider,
   usePortalNavigation,
   BackButton,
@@ -89,6 +107,11 @@ const portalEnhancements = {
   KnowledgeGraphCard,
   FeedScreen,
   PreserveScreen,
+  HomeBentoPanel,
+  ResearchScreen,
+  YouIdentityBadge,
+  YouAccountFooter,
+  PatientSwitcherModal,
   SwitcherExtras,
 };
 

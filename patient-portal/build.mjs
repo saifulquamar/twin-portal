@@ -166,17 +166,33 @@ async function main() {
     'OnboardingFlow (te)'
   );
 
-  // 4. Replace Ask / Clinical AI (di) with grounded AskPanel + clickable citations + D3 Knowledge Graph
+  // 4. Replace Home Bento Panel (Oa) + make 3D stage twin-feed button a crisp "+" icon shortcut
+  patched = replaceWholeFunction(
+    patched,
+    'function Oa({b:e,go:t,counts:n,open:r,onBio:i}){',
+    'function Oa({b:e,go:t,counts:n,open:r,onBio:i}){return(0,S.jsx)(globalThis.__MX_PORTAL__.HomeBentoPanel,{b:e,go:t,counts:n,open:r,onBio:i,nextStepFn:Ca,panelUnlockCountFn:va,Ring:Te,Takeaway:Ee,Icon:J,readStore:R,formatDate:M})}',
+    'HomeBentoPanel (Oa)'
+  );
+
+  const stageFeedBtnAnchor =
+    'className:`twin-feed`,onClick:()=>t(`you`,`feed`),"aria-label":`Feed your twin: add a result, measurement, medicine or symptom`,children:[(0,S.jsx)(`span`,{"aria-hidden":!0,children:`+`}),(0,S.jsx)(`em`,{children:`Feed your twin`})]';
+  patched = replaceUniqueSubstring(
+    patched,
+    stageFeedBtnAnchor,
+    'className:`twin-feed mx-twin-feed-icon`,title:`Feed your twin`,onClick:()=>t(`you`,`feed`),"aria-label":`Feed your twin: add test results, measurements, medicines, symptoms or diary`,children:[(0,S.jsx)(`span`,{"aria-hidden":!0,children:`+`})]',
+    'Home 3D stage twin-feed icon button'
+  );
+
+  // 5. Replace Ask / Clinical AI (di) with voice-first self-perspective AskPanel + 3D speaking Twin + D3 Knowledge Graph
   patched = replaceWholeFunction(
     patched,
     'function di({b:e,openFinding:t,embedded:n=!1,initial:r}){',
-    'function di({b:e,openFinding:t,embedded:n=!1,initial:r}){return(0,S.jsx)(globalThis.__MX_PORTAL__.AskPanel,{b:e,openFinding:t,embedded:n,initial:r,host:{getPatientId:D,readStore:R,writeStore:z,formatDate:M,useDoctor:xi,loadDoctorDoc:ce,cdssPrompts:K,crisisRegex:ii,CrisisBanner:ai,checkHealth:li,apiBase:oi}})}',
+    'function di({b:e,openFinding:t,embedded:n=!1,initial:r}){return(0,S.jsx)(globalThis.__MX_PORTAL__.AskPanel,{b:e,openFinding:t,embedded:n,initial:r,host:{getPatientId:D,readStore:R,writeStore:z,formatDate:M,useDoctor:xi,loadDoctorDoc:ce,cdssPrompts:K,crisisRegex:ii,CrisisBanner:ai,checkHealth:li,apiBase:oi,PatientTwin3D:Og}})}',
     'AskPanel (di)'
   );
 
-  // 5. Inject ClinicianBriefingCard + KnowledgeGraphCard on Doctor View Clinical Overview (Ai)
-  const aiOverviewAnchor =
-    'function Ai({b:e,doc:t,setSeg:n}){';
+  // 6. Inject ClinicianBriefingCard + KnowledgeGraphCard on Doctor View Clinical Overview (Ai)
+  const aiOverviewAnchor = 'function Ai({b:e,doc:t,setSeg:n}){';
   const aiIdx = assertUniqueAnchor(patched, aiOverviewAnchor, 'Clinical Overview (Ai)');
   const aiGridSubAnchor = 'return(0,S.jsxs)(`div`,{className:`rs-grid`,children:[';
   const gridPos = patched.indexOf(aiGridSubAnchor, aiIdx);
@@ -188,24 +204,23 @@ async function main() {
     'return(0,S.jsxs)(`div`,{className:`rs-grid`,children:[(0,S.jsx)(globalThis.__MX_PORTAL__.ClinicianBriefingCard,{b:e,doc:t,readStore:R,formatDate:M}),(0,S.jsx)(`div`,{className:`rs-wide`,children:(0,S.jsx)(globalThis.__MX_PORTAL__.KnowledgeGraphCard,{b:e,doc:t,readStore:R,openFinding:id=>{location.hash=`/research/f:${id}`}})}),' +
     patched.slice(gridPos + aiGridSubAnchor.length);
 
-  // 6. Inject SwitcherExtras in Patient Switcher sheet (zi)
-  const switcherAnchor = '(0,S.jsx)(`h2`,{children:`Switch patient`}),';
-  patched = replaceUniqueSubstring(
+  // 7. Replace Patient Switcher (zi) with role-gated PatientSwitcherModal + Admin Mode + 12-Twin roster
+  patched = replaceWholeFunction(
     patched,
-    switcherAnchor,
-    `${switcherAnchor}(0,S.jsx)(globalThis.__MX_PORTAL__.SwitcherExtras,{onCloseSheet:()=>a(!1),setDoctorMode:bi}),`,
-    'Switch patient sheet (zi)'
+    'function zi({b:e,compact:t=!1}){',
+    'function zi({b:e,compact:t=!1}){return(0,S.jsx)(globalThis.__MX_PORTAL__.PatientSwitcherModal,{b:e,compact:t,loadPatientIndex:k,getPatientId:D,switchPatient:O,DoctorToggle:Si,setDoctorMode:bi,Sheet:$r,SwitcherExtras:globalThis.__MX_PORTAL__.SwitcherExtras})}',
+    'PatientSwitcherModal (zi)'
   );
 
-  // 7. Replace Preserve yourself (gi) with Three.js 3D + Gemini Voice & Face Studio
+  // 8. Replace Preserve yourself (gi) with 3-Step Digital Identity Preservation Studio + 3D Twin + Voice Engine
   patched = replaceWholeFunction(
     patched,
     'function gi({b:e}){',
-    'function gi({b:e}){return(0,S.jsx)(globalThis.__MX_PORTAL__.PreserveScreen,{b:e,host:{getPatientId:D,readStore:R,writeStore:z,formatDate:M,Hero:_e,Icon:J,apiBase:oi}})}',
+    'function gi({b:e}){return(0,S.jsx)(globalThis.__MX_PORTAL__.PreserveScreen,{b:e,host:{getPatientId:D,readStore:R,writeStore:z,formatDate:M,Hero:_e,Icon:J,apiBase:oi,PatientTwin3D:Og}})}',
     'PreserveScreen (gi)'
   );
 
-  // 8. Replace Feed your twin (ma) with upgraded ReportScanForm + Patient Briefing card
+  // 9. Replace Feed your twin (ma) with 8-Category Multimodal Feed System + AI Interpreter
   patched = replaceWholeFunction(
     patched,
     'function ma({b:e}){',
@@ -213,17 +228,42 @@ async function main() {
     'FeedScreen (ma)'
   );
 
-  // 9. Inject interactive D3 KnowledgeGraphCard on Research findings screen (Za)
-  const researchAnchor =
-    '(0,S.jsxs)(`div`,{className:`rf-list`,children:[(0,S.jsx)($a,{b:e,go:n}),';
-  patched = replaceUniqueSubstring(
+  // 10. Replace Research screen (Za) with interactive priority filters + restored Method tab + KnowledgeGraphCard
+  patched = replaceWholeFunction(
     patched,
-    researchAnchor,
-    `${researchAnchor}(0,S.jsx)(globalThis.__MX_PORTAL__.KnowledgeGraphCard,{b:e,readStore:R,openFinding:o}),`,
-    'Research findings list (Za)'
+    'function Za({b:e,sub:t,go:n}){',
+    'function Za({b:e,sub:t,go:n}){return(0,S.jsx)(globalThis.__MX_PORTAL__.ResearchScreen,{b:e,sub:t,go:n,PageHead:ve,SegmentedTabs:ye,ResearchSourcesTab:to,ResearchMethodTab:hi,ResearchGenesTab:Ha,ResearchDossierTab:Fa,ResearchFindingDetail:eo,Sheet:$r,Icon:J,CertaintyGrade:Y,Takeaway:Ee,readStore:R,priorityMapper:Ya,certaintyGrades:P,useDesktopQuery:Xa})}',
+    'ResearchScreen (Za)'
   );
 
-  // 10. Ensure #/ask/ask routes straight to the Ask tab (checkin:ask) instead of Today check-in
+  // 11. Upgrade You screen (Jg): Preserve subtitle, compact Digital Identity Badge, and working Account/Auth footer
+  const preserveMenuAnchor = '[`preserve`,`Preserve yourself`,`Join the waitlist`,`preserve`]';
+  patched = replaceUniqueSubstring(
+    patched,
+    preserveMenuAnchor,
+    '[`preserve`,`Preserve yourself`,`3D likeness, personal voice & memory vault`,`preserve`]',
+    'Preserve menu subtitle (qg)'
+  );
+
+  const youProfileCardAnchor =
+    '(0,S.jsxs)(`section`,{className:`profile-card`,children:[(0,S.jsxs)(`div`,{className:`pc-top`,children:[(0,S.jsx)(`span`,{className:`avatar lg`,children:e.patient.preferred_name[0]}),(0,S.jsxs)(`div`,{children:[(0,S.jsx)(`h1`,{children:R(`mx-profile`,{}).preferred_name||e.patient.preferred_name}),(0,S.jsxs)(`p`,{className:`note`,children:[i.years,` years · twin since `,M(e.patient.twin_created)]})]}),(0,S.jsx)(zi,{b:e})]}),(0,S.jsx)(`div`,{className:`pc-journey`,children:(e.journey_stages??[]).map((e,t)=>(0,S.jsxs)(`button`,{onClick:()=>n(`you`,`journey-${e.n}`),children:[(0,S.jsx)(Te,{value:e.done,total:e.total,size:40}),(0,S.jsxs)(`span`,{children:[(0,S.jsx)(`b`,{children:[`Assessment`,`Longevity`,`Personal`][t]}),(0,S.jsxs)(`small`,{children:[e.done,`/`,e.total]})]})]},e.n))}),(0,S.jsxs)(`div`,{className:`row-btns`,children:[(0,S.jsx)(`button`,{className:`primary sm`,onClick:()=>n(`you`,`profile`),children:`Edit profile`}),(0,S.jsx)(`button`,{className:`secondary sm`,onClick:()=>n(`you`,`journey`),children:`Your journey`})]})]})';
+  patched = replaceUniqueSubstring(
+    patched,
+    youProfileCardAnchor,
+    '(0,S.jsx)(globalThis.__MX_PORTAL__.YouIdentityBadge,{b:e,go:n,getPatientId:D,calcAge:N,formatDate:M,readStore:R,Ring:Te,Icon:J,PatientSwitcher:zi})',
+    'YouIdentityBadge (Jg)'
+  );
+
+  const youLogoutAnchor =
+    '(0,S.jsx)(`button`,{className:`logout`,disabled:!0,title:`Sign-in arrives with your Mutanex account`,children:`Log out`}),(0,S.jsx)(`p`,{className:`note center`,children:`Sign-in, and so log out, arrive with your Mutanex account. Today your twin runs privately on this device.`})';
+  patched = replaceUniqueSubstring(
+    patched,
+    youLogoutAnchor,
+    '(0,S.jsx)(globalThis.__MX_PORTAL__.YouAccountFooter,{b:e,go:n})',
+    'YouAccountFooter (Jg)'
+  );
+
+  // 12. Ensure #/ask/ask routes straight to the Ask tab (checkin:ask) instead of Today check-in
   const askRouteAnchor = 'sub:n&&e!==`ask`?n:l_[e][1]';
   patched = replaceUniqueSubstring(
     patched,
@@ -232,7 +272,7 @@ async function main() {
     'Ask route sub-tab resolver (u_)'
   );
 
-  // 11. Wire root app d_() directly to React-state NavigationProvider & usePortalNavigation
+  // 13. Wire root app d_() directly to AuthProvider + React-state NavigationProvider
   const rootNavAnchor =
     '[{tab:i,sub:a},o]=(0,_.useState)(u_),s=xi()&&!0;(0,_.useEffect)(()=>{Qg({...Zg,...R(`mx-prefs`,{})})},[]),(0,_.useEffect)(()=>{A().then(t,e=>r(String(e.message||e)))},[]),(0,_.useEffect)(()=>{let e=()=>o(u_());return window.addEventListener(`hashchange`,e),()=>window.removeEventListener(`hashchange`,e)},[]);let c=(e,t)=>{let n=e===`panel`&&(t===`book`||t?.startsWith(`t:`))||e===`twin`&&t?.startsWith(`o:`);location.hash=`/${e}${t?`/${t}`:``}`,n||(window.scrollTo(0,0),document.querySelector(`.pane`)?.scrollTo(0,0))};';
   patched = replaceUniqueSubstring(
@@ -246,8 +286,8 @@ async function main() {
   patched = replaceUniqueSubstring(
     patched,
     rootMountAnchor,
-    'children:(0,S.jsx)(globalThis.__MX_PORTAL__.NavigationProvider,{children:(0,S.jsx)(d_,{})})',
-    'NavigationProvider root mount'
+    'children:(0,S.jsx)(globalThis.__MX_PORTAL__.AuthProvider,{children:(0,S.jsx)(globalThis.__MX_PORTAL__.NavigationProvider,{children:(0,S.jsx)(d_,{})})})',
+    'AuthProvider + NavigationProvider root mount'
   );
 
   fs.writeFileSync(targetMainBundlePath, patched, 'utf8');

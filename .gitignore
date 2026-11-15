@@ -27,3 +27,4 @@ scratch/
 # Reference source & test captures
 MyTwin_Portal_Source/
 .playwright-cli/
+data/

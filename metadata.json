@@ -1,7 +1,7 @@
 {
   "name": "Mutanex - My Twin",
   "description": "Digital twin patient health portal with interactive 3D anatomy, clinical insights, and Gemini-powered twin assistant.",
-  "requestFramePermissions": ["microphone"],
+  "requestFramePermissions": ["microphone", "camera"],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]

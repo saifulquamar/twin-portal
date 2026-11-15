@@ -7,8 +7,8 @@ Node 20 + TypeScript + Express server that powers the **Ask your twin** and **Ex
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GEMINI_API_KEY` | **Yes** | — | Google Gemini API key |
-| `GEMINI_MODEL` | No | `gemini-2.0-flash` | Gemini model to use |
-| `PORT` | No | `8080` | HTTP listen port |
+| `GEMINI_MODEL` | No | `gemini-4-hydrogen` | Gemini model to use |
+| `PORT` | No | `3000` | HTTP listen port |
 | `HOST` | No | `0.0.0.0` | HTTP listen host |
 | `PORTAL_ORIGIN` | No | — | Deployed portal URL for CORS (e.g. `https://twin.example.com`). Set to `*` to allow all origins. |
 

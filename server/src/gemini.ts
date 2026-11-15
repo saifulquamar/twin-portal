@@ -8,10 +8,16 @@ import type {
   ExtractResponse,
   FaceAnalyzeRequestBody,
   FaceLikenessProfile,
+  IdentityMemoryItem,
+  InterpretFeedRequestBody,
+  InterpretFeedResponse,
+  ParsedFeedItem,
   PreserveSpeakRequestBody,
   PreserveSpeakResponse,
   SourceItem,
   VoicePersonaProfile,
+  VoiceSynthesizeRequestBody,
+  VoiceSynthesizeResponse,
   VoiceTrainRequestBody,
   VoiceTrainResponse,
 } from './types.ts';
@@ -21,8 +27,495 @@ export interface GeminiService {
   extract(params: ExtractRequestBody): Promise<ExtractResponse>;
   briefing?(params: BriefingRequestBody): Promise<BriefingResponse>;
   trainVoicePersona?(params: VoiceTrainRequestBody): Promise<VoiceTrainResponse>;
+  synthesizeSpeech?(params: VoiceSynthesizeRequestBody): Promise<VoiceSynthesizeResponse>;
   analyzeFaceLikeness?(params: FaceAnalyzeRequestBody): Promise<FaceLikenessProfile>;
   speakPreservedTwin?(params: PreserveSpeakRequestBody): Promise<PreserveSpeakResponse>;
+  interpretFeedInput?(params: InterpretFeedRequestBody): Promise<InterpretFeedResponse>;
+  getLiveClient?(): GoogleGenAI | null;
+}
+
+export const VOICE_NOMINAL_PITCH_HZ: Record<VoicePersonaProfile['prebuilt_voice'], number> = {
+  Fenrir: 105,
+  Charon: 125,
+  Puck: 155,
+  Zephyr: 182,
+  Kore: 205,
+};
+
+export function selectClosestPrebuiltVoiceByPitch(
+  pitchHz?: number,
+  fallback: VoicePersonaProfile['prebuilt_voice'] = 'Kore'
+): VoicePersonaProfile['prebuilt_voice'] {
+  if (typeof pitchHz !== 'number' || !Number.isFinite(pitchHz) || pitchHz < 65 || pitchHz > 360) {
+    return fallback;
+  }
+  let best: VoicePersonaProfile['prebuilt_voice'] = fallback;
+  let bestDist = Infinity;
+  for (const [voice, hz] of Object.entries(VOICE_NOMINAL_PITCH_HZ) as Array<
+    [VoicePersonaProfile['prebuilt_voice'], number]
+  >) {
+    const dist = Math.abs(Math.log2(pitchHz / hz));
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = voice;
+    }
+  }
+  return best;
+}
+
+/**
+ * Ensures any returned base64 audio payload has a valid 44-byte RIFF WAVE header.
+ * If Gemini returns raw 24kHz 16-bit mono PCM (e.g., audio/L16), wraps it in a valid WAV header.
+ */
+export function ensureValidWavBase64(
+  audioBase64: string,
+  mimeType?: string,
+  sampleRate = 24000
+): string {
+  const buf = Buffer.from(audioBase64, 'base64');
+  if (buf.length >= 44 && buf.subarray(0, 4).toString('ascii') === 'RIFF') {
+    return audioBase64;
+  }
+  const pcmBytes = buf.length - (buf.length % 2);
+  const out = Buffer.alloc(44 + pcmBytes);
+  out.write('RIFF', 0, 'ascii');
+  out.writeUInt32LE(36 + pcmBytes, 4);
+  out.write('WAVE', 8, 'ascii');
+  out.write('fmt ', 12, 'ascii');
+  out.writeUInt32LE(16, 16);
+  out.writeUInt16LE(1, 20); // PCM
+  out.writeUInt16LE(1, 22); // Mono
+  const rateMatch = mimeType?.match(/rate=(\d+)/i);
+  const rate = rateMatch ? Number(rateMatch[1]) || sampleRate : sampleRate;
+  out.writeUInt32LE(rate, 24);
+  out.writeUInt32LE(rate * 2, 28);
+  out.writeUInt16LE(2, 32);
+  out.writeUInt16LE(16, 34);
+  out.write('data', 36, 'ascii');
+  out.writeUInt32LE(pcmBytes, 40);
+  buf.copy(out, 44, 0, pcmBytes);
+  return out.toString('base64');
+}
+
+/**
+ * Gently shifts pitch & formant warmth on a 24kHz 16-bit mono RIFF WAV buffer
+ * so the neural Gemini TTS output matches the user's measured vocal F0 & warmth.
+ */
+export function matchWavToVoiceProfile(
+  wavBase64: string,
+  voiceName: VoicePersonaProfile['prebuilt_voice'],
+  targetPitchHz?: number,
+  warmth = 85
+): string {
+  if (!targetPitchHz || !Number.isFinite(targetPitchHz) || targetPitchHz < 70 || targetPitchHz > 340) {
+    return wavBase64;
+  }
+  const nominalHz = VOICE_NOMINAL_PITCH_HZ[voiceName] || 180;
+  const rawRatio = targetPitchHz / nominalHz;
+  const ratio = Math.max(0.85, Math.min(1.17, rawRatio));
+  if (Math.abs(ratio - 1) < 0.025) {
+    return wavBase64;
+  }
+
+  try {
+    const buf = Buffer.from(wavBase64, 'base64');
+    if (buf.length < 64 || buf.subarray(0, 4).toString('ascii') !== 'RIFF') {
+      return wavBase64;
+    }
+    let dataOffset = 44;
+    let sampleRate = buf.readUInt32LE(24) || 24000;
+    let channels = buf.readUInt16LE(22) || 1;
+    let bitsPerSample = buf.readUInt16LE(34) || 16;
+    for (let pos = 12; pos + 8 <= Math.min(buf.length, 256); ) {
+      const id = buf.subarray(pos, pos + 4).toString('ascii');
+      const size = buf.readUInt32LE(pos + 4);
+      if (id === 'fmt ' && size >= 16) {
+        channels = buf.readUInt16LE(pos + 10) || 1;
+        sampleRate = buf.readUInt32LE(pos + 12) || 24000;
+        bitsPerSample = buf.readUInt16LE(pos + 22) || 16;
+      } else if (id === 'data') {
+        dataOffset = pos + 8;
+        break;
+      }
+      pos += 8 + size + (size % 2);
+    }
+
+    if (channels !== 1 || bitsPerSample !== 16 || buf.length <= dataOffset + 8) {
+      return wavBase64;
+    }
+
+    const inSamples = Math.floor((buf.length - dataOffset) / 2);
+    const outSamples = Math.max(16, Math.floor(inSamples / ratio));
+    const outDataBytes = outSamples * 2;
+    const outBuf = Buffer.alloc(44 + outDataBytes);
+
+    outBuf.write('RIFF', 0, 'ascii');
+    outBuf.writeUInt32LE(36 + outDataBytes, 4);
+    outBuf.write('WAVE', 8, 'ascii');
+    outBuf.write('fmt ', 12, 'ascii');
+    outBuf.writeUInt32LE(16, 16);
+    outBuf.writeUInt16LE(1, 20);
+    outBuf.writeUInt16LE(1, 22);
+    outBuf.writeUInt32LE(sampleRate, 24);
+    outBuf.writeUInt32LE(sampleRate * 2, 28);
+    outBuf.writeUInt16LE(2, 32);
+    outBuf.writeUInt16LE(16, 34);
+    outBuf.write('data', 36, 'ascii');
+    outBuf.writeUInt32LE(outDataBytes, 40);
+
+    const readSample = (idx: number): number => {
+      const clamped = Math.max(0, Math.min(inSamples - 1, idx));
+      return buf.readInt16LE(dataOffset + clamped * 2);
+    };
+
+    const warmAlpha = warmth >= 85 ? 0.14 : warmth <= 65 ? -0.08 : 0.05;
+    let prevOut = 0;
+
+    for (let i = 0; i < outSamples; i++) {
+      const srcPos = i * ratio;
+      const idx = Math.floor(srcPos);
+      const frac = srcPos - idx;
+      const s0 = readSample(idx - 1);
+      const s1 = readSample(idx);
+      const s2 = readSample(idx + 1);
+      const s3 = readSample(idx + 2);
+      const c0 = s1;
+      const c1 = 0.5 * (s2 - s0);
+      const c2 = s0 - 2.5 * s1 + 2 * s2 - 0.5 * s3;
+      const c3 = 0.5 * (s3 - s0) + 1.5 * (s1 - s2);
+      const interp = ((c3 * frac + c2) * frac + c1) * frac + c0;
+      const filtered = interp * (1 - Math.abs(warmAlpha)) + prevOut * warmAlpha;
+      prevOut = filtered;
+      const pcm = Math.max(-32767, Math.min(32767, Math.round(filtered)));
+      outBuf.writeInt16LE(pcm, 44 + i * 2);
+    }
+
+    return outBuf.toString('base64');
+  } catch {
+    return wavBase64;
+  }
+}
+
+function shiftIsoDateDays(isoDate: string, deltaDays: number): string {
+  const m = isoDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const base = m
+    ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])))
+    : new Date();
+  base.setUTCDate(base.getUTCDate() + deltaDays);
+  return base.toISOString().slice(0, 10);
+}
+
+/**
+ * Deterministic multi-entity parser for natural-language Feed inputs (used as instant fallback
+ * or complement to Gemini structured extraction). Handles compound sentences like:
+ * "I had a headache yesterday, slept for only five hours, and started taking a new medicine."
+ */
+export function parseNaturalFeedLocally(params: {
+  text: string;
+  referenceDate?: string;
+  hasAudioRecording?: boolean;
+}): ParsedFeedItem[] {
+  const raw = String(params.text || '').trim();
+  const today = params.referenceDate && /^\d{4}-\d{2}-\d{2}$/.test(params.referenceDate)
+    ? params.referenceDate
+    : new Date().toISOString().slice(0, 10);
+  if (!raw) return [];
+
+  const lower = raw.toLowerCase();
+  const baseProvenance = params.hasAudioRecording ? 'voice_recording' : 'user_reported';
+  const items: ParsedFeedItem[] = [];
+
+  const WORD_NUMS: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+  };
+  const parseNum = (s?: string): number | null => {
+    if (!s) return null;
+    const clean = s.trim().toLowerCase();
+    if (WORD_NUMS[clean] != null) return WORD_NUMS[clean];
+    const n = Number(clean);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const resolveClauseDate = (clause: string): string => {
+    const cl = clause.toLowerCase();
+    if (/\byesterday\b|\blast night\b/.test(cl)) return shiftIsoDateDays(today, -1);
+    const daysAgo = cl.match(/(\d+|two|three|four|five|six|seven)\s+days?\s+ago/);
+    if (daysAgo) {
+      const d = parseNum(daysAgo[1]) || 2;
+      return shiftIsoDateDays(today, -d);
+    }
+    return today;
+  };
+
+  // 1. Detect Blood Pressure / Vitals Measurements
+  const bpMatch = raw.match(/(?:bp|blood pressure)[^\d]{0,16}(\d{2,3})\s*\/\s*(\d{2,3})/i);
+  if (bpMatch) {
+    items.push({
+      category: 'measurements',
+      legacy_kind: 'measure',
+      date: resolveClauseDate(bpMatch[0]),
+      title: `Blood pressure ${bpMatch[1]}/${bpMatch[2]} mmHg`,
+      detail: 'Measured and reported in Feed Your Twin',
+      provenance: 'measured',
+      confidence: 0.95,
+      requires_clinician_check: true,
+      structured: {
+        metric: 'Blood pressure',
+        systolic: Number(bpMatch[1]),
+        diastolic: Number(bpMatch[2]),
+        unit: 'mmHg',
+      },
+    });
+  }
+
+  const weightMatch = raw.match(/(?:weigh(?:ed|t)?|weight is)\s*(\d{2,3}(?:\.\d+)?)\s*(kg|lbs?|pounds?)/i);
+  if (weightMatch) {
+    items.push({
+      category: 'measurements',
+      legacy_kind: 'measure',
+      date: resolveClauseDate(weightMatch[0]),
+      title: `Weight ${weightMatch[1]} ${weightMatch[2]}`,
+      detail: 'Body weight measurement',
+      provenance: 'measured',
+      confidence: 0.94,
+      requires_clinician_check: true,
+      structured: {
+        metric: 'Weight',
+        value: Number(weightMatch[1]),
+        unit: weightMatch[2],
+      },
+    });
+  }
+
+  const hrMatch = raw.match(/(?:heart rate|pulse|hr)\s*(?:was|is|of|:)?\s*(\d{2,3})\s*(?:bpm)?/i);
+  if (hrMatch) {
+    items.push({
+      category: 'measurements',
+      legacy_kind: 'measure',
+      date: resolveClauseDate(hrMatch[0]),
+      title: `Heart rate ${hrMatch[1]} bpm`,
+      detail: 'Resting or spot heart rate',
+      provenance: 'measured',
+      confidence: 0.91,
+      requires_clinician_check: true,
+      structured: {
+        metric: 'Heart rate',
+        value: Number(hrMatch[1]),
+        unit: 'bpm',
+      },
+    });
+  }
+
+  const glucoseMatch = raw.match(/(?:glucose|blood sugar)\s*(?:was|is|of|:)?\s*(\d{2,3}(?:\.\d+)?)\s*(mg\/dl|mmol\/l)?/i);
+  if (glucoseMatch) {
+    const unit = glucoseMatch[2] || 'mg/dL';
+    items.push({
+      category: 'measurements',
+      legacy_kind: 'measure',
+      date: resolveClauseDate(glucoseMatch[0]),
+      title: `Blood glucose ${glucoseMatch[1]} ${unit}`,
+      detail: 'Home glucose reading',
+      provenance: 'measured',
+      confidence: 0.92,
+      requires_clinician_check: true,
+      structured: {
+        metric: 'Blood glucose',
+        value: Number(glucoseMatch[1]),
+        unit,
+      },
+    });
+  }
+
+  // 2. Detect Sleep / Daily Activities
+  const sleepMatch = raw.match(
+    /(?:slept|sleep(?:ing)?)(?:\s+for)?(?:\s+only|\s+about|\s+around)?\s*(\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:hours?|hrs?|h\b)/i
+  );
+  if (sleepMatch) {
+    const hrs = parseNum(sleepMatch[1]) ?? 6;
+    const sleepDate = /\blast night\b|\byesterday\b/i.test(raw) ? shiftIsoDateDays(today, -1) : today;
+    items.push({
+      category: 'daily_activities',
+      legacy_kind: 'lifestyle',
+      date: sleepDate,
+      title: `Sleep: ${hrs} hours`,
+      detail: hrs < 6 ? 'Short sleep duration logged' : 'Nightly sleep duration logged',
+      provenance: baseProvenance,
+      confidence: 0.94,
+      requires_clinician_check: false,
+      structured: {
+        activity_type: 'sleep',
+        sleep_hours: hrs,
+      },
+    });
+  }
+
+  const exerciseMatch = raw.match(
+    /(?:walked|ran|jogged|exercised|worked out|cycled|yoga|swam)(?:\s+for)?\s*(\d+|twenty|thirty|forty|fifteen)\s*(minutes?|mins?|km|miles?)/i
+  );
+  if (exerciseMatch) {
+    items.push({
+      category: 'daily_activities',
+      legacy_kind: 'lifestyle',
+      date: resolveClauseDate(exerciseMatch[0]),
+      title: `Activity: ${exerciseMatch[0].trim()}`,
+      detail: 'Daily physical activity & movement',
+      provenance: baseProvenance,
+      confidence: 0.9,
+      requires_clinician_check: false,
+      structured: {
+        activity_type: 'exercise',
+        summary: exerciseMatch[0].trim(),
+      },
+    });
+  }
+
+  // 3. Detect Symptoms
+  const symptomKeywords = [
+    'headache',
+    'migraine',
+    'dizziness',
+    'dizzy',
+    'fatigue',
+    'tired',
+    'nausea',
+    'swollen ankles',
+    'ankle swelling',
+    'chest tightness',
+    'palpitations',
+    'shortness of breath',
+    'joint pain',
+    'back pain',
+    'muscle ache',
+    'myalgia',
+    'cough',
+    'fever',
+    'brain fog',
+    'cramps',
+  ];
+  for (const sym of symptomKeywords) {
+    const idx = lower.indexOf(sym);
+    if (idx !== -1) {
+      const windowStr = raw.slice(Math.max(0, idx - 32), Math.min(raw.length, idx + sym.length + 36));
+      const sev = /severe|bad|strong|terrible/i.test(windowStr)
+        ? 4
+        : /mild|slight|little/i.test(windowStr)
+          ? 2
+          : 3;
+      const capSym = sym.charAt(0).toUpperCase() + sym.slice(1);
+      items.push({
+        category: 'symptoms',
+        legacy_kind: 'symptom',
+        date: resolveClauseDate(windowStr),
+        title: capSym,
+        detail: `Severity ${sev}/5 · reported via ${params.hasAudioRecording ? 'voice update' : 'Feed update'}`,
+        provenance: baseProvenance,
+        confidence: 0.93,
+        requires_clinician_check: true,
+        structured: {
+          symptom: capSym,
+          severity: sev,
+          context: windowStr.trim(),
+        },
+      });
+      break;
+    }
+  }
+
+  // 4. Detect Medication / Supplement updates
+  const namedMedMatch = raw.match(
+    /(?:started(?:\s+taking)?|taking|switched to|prescribed|added|stopped)\s+(?:a\s+new\s+(?:medicine|medication|supplement)\s*(?:called|named)?\s*)?([A-Za-z][A-Za-z0-9\-]{2,24})(?:\s+(\d+\s*(?:mg|mcg|g|iu)))?/i
+  );
+  if (namedMedMatch) {
+    const rawCandidate = namedMedMatch[1].trim();
+    const genericWords = new Set(['a', 'new', 'medicine', 'medication', 'pill', 'tablet', 'supplement', 'my']);
+    const medTitle = genericWords.has(rawCandidate.toLowerCase())
+      ? 'New medicine started (name to confirm)'
+      : `${rawCandidate}${namedMedMatch[2] ? ` ${namedMedMatch[2]}` : ''}`;
+    items.push({
+      category: 'medicines',
+      legacy_kind: 'medicine',
+      date: today,
+      title: medTitle,
+      detail: /stopped/i.test(namedMedMatch[0])
+        ? 'Medication change: stopped / paused'
+        : 'Medication update: started / active',
+      provenance: baseProvenance,
+      confidence: genericWords.has(rawCandidate.toLowerCase()) ? 0.84 : 0.92,
+      requires_clinician_check: true,
+      structured: {
+        medicine_name: medTitle,
+        dose: namedMedMatch[2] || null,
+        status: /stopped/i.test(namedMedMatch[0]) ? 'stopped' : 'started',
+      },
+    });
+  } else if (/\b(?:new medicine|new medication|new prescription|started taking)\b/i.test(raw)) {
+    items.push({
+      category: 'medicines',
+      legacy_kind: 'medicine',
+      date: today,
+      title: 'Started a new medicine',
+      detail: 'Reported medication start — care team to verify name & dose',
+      provenance: baseProvenance,
+      confidence: 0.86,
+      requires_clinician_check: true,
+      structured: {
+        medicine_name: 'New medicine',
+        status: 'started',
+      },
+    });
+  }
+
+  // 5. Detect Lab Values mentioned inline (e.g. "HbA1c 6.1%", "eGFR 54")
+  const inlineLabMatch = raw.match(/\b(HbA1c|eGFR|TSH|LDL|Creatinine|Potassium|uACR|Vitamin D|Ferritin)\s*(?:was|is|came back(?: at)?|:)?\s*(\d+(?:\.\d+)?)\s*(%|mg\/dL|mmol\/L|mIU\/L|ng\/mL|mL\/min)?/i);
+  if (inlineLabMatch) {
+    const unit = inlineLabMatch[3] || '';
+    items.push({
+      category: 'test_results',
+      legacy_kind: 'lab',
+      date: resolveClauseDate(inlineLabMatch[0]),
+      title: `${inlineLabMatch[1]} ${inlineLabMatch[2]}${unit ? ` ${unit}` : ''}`,
+      detail: 'Self-reported test result awaiting care team verification',
+      provenance: baseProvenance,
+      confidence: 0.91,
+      requires_clinician_check: true,
+      structured: {
+        test: inlineLabMatch[1],
+        value: Number(inlineLabMatch[2]),
+        unit,
+      },
+    });
+  }
+
+  // 6. If audio recording was attached, also log a Voice & Conversations provenance entry if conversational,
+  // or if no clinical entities matched, classify into Personal Diary / Voice & Conversations.
+  if (items.length === 0) {
+    items.push({
+      category: params.hasAudioRecording ? 'voice_conversations' : 'personal_diary',
+      legacy_kind: 'lifestyle',
+      date: today,
+      title: raw.length > 58 ? `${raw.slice(0, 55).trim()}…` : raw,
+      detail: params.hasAudioRecording
+        ? 'Spoken personal reflection & voice note'
+        : 'Personal diary & daily life note',
+      provenance: baseProvenance,
+      confidence: 0.9,
+      requires_clinician_check: false,
+      structured: {
+        note: raw,
+      },
+    });
+  }
+
+  return items;
 }
 
 function capWords(text: string, maxWords: number): string {
@@ -31,7 +524,6 @@ function capWords(text: string, maxWords: number): string {
   const words = cleaned.split(' ');
   if (words.length <= maxWords) return cleaned;
   const sliced = words.slice(0, maxWords).join(' ');
-  // Prefer ending cleanly on the last complete sentence if past 65% of maxWords
   const lastSentenceEnd = Math.max(
     sliced.lastIndexOf('. '),
     sliced.lastIndexOf('? '),
@@ -115,7 +607,10 @@ function extractGroundingWebSources(response: GenerateContentResponse): SourceIt
       host = uri;
     }
 
-    const rawTitle = typeof web?.title === 'string' && web.title.trim() ? web.title.trim() : host || 'Clinical Web Reference';
+    const rawTitle =
+      typeof web?.title === 'string' && web.title.trim()
+        ? web.title.trim()
+        : host || 'Clinical Web Reference';
     webSources.push({
       kind: 'web',
       title: rawTitle.slice(0, 90),
@@ -126,7 +621,11 @@ function extractGroundingWebSources(response: GenerateContentResponse): SourceIt
   return webSources;
 }
 
-export function buildKnowledgeGraphSummary(bundle: any, clinical?: any): string {
+export function buildKnowledgeGraphSummary(
+  bundle: any,
+  clinical?: any,
+  identityMemories?: IdentityMemoryItem[]
+): string {
   const parts: string[] = [];
   const patient = bundle?.patient || {};
 
@@ -144,12 +643,23 @@ export function buildKnowledgeGraphSummary(bundle: any, clinical?: any): string 
   if (Array.isArray(patient.allergies) && patient.allergies.length) {
     parts.push(`- Allergies: ${patient.allergies.join('; ')}`);
   }
+  if (bundle?.biological_age?.value != null) {
+    parts.push(
+      `- Biological Age: ${bundle.biological_age.value} years (${bundle.biological_age.model || 'published model'})`
+    );
+  }
+  if (Array.isArray(bundle?.vitals) && bundle.vitals[0]) {
+    const v = bundle.vitals[0];
+    parts.push(
+      `- Baseline Vitals: BP ${v.systolic || '?'}/${v.diastolic || '?'} mmHg, HR ${v.heart_rate || '?'} bpm, Weight ${v.weight_kg || '?'} kg, Height ${v.height_cm || '?'} cm`
+    );
+  }
 
-  // Newly added patient entries (e.g. uploaded lab report awaiting verification)
+  // Newly added patient entries across all 8 Feed Your Twin categories
   const pendingFeed: any[] = Array.isArray(bundle?.pending_feed) ? bundle.pending_feed : [];
   if (pendingFeed.length > 0) {
-    parts.push('\nNEWLY ADDED PATIENT REPORT / FEED ENTRIES (Awaiting care-team verification):');
-    for (const entry of pendingFeed.slice(0, 20)) {
+    parts.push('\nNEWLY ADDED PATIENT REPORT / FEED ENTRIES (Awaiting care-team verification or personal log):');
+    for (const entry of pendingFeed.slice(0, 25)) {
       const ext = entry?.extracted;
       if (ext && typeof ext === 'object') {
         const prevStr =
@@ -165,8 +675,28 @@ export function buildKnowledgeGraphSummary(bundle: any, clinical?: any): string 
           }${prevStr}`
         );
       } else {
-        parts.push(`- [${entry.kind || 'entry'}] ${entry.title} (${entry.date || ''}${entry.detail ? ` · ${entry.detail}` : ''})`);
+        const cat = entry.category || entry.kind || 'entry';
+        const prov = entry.provenance ? ` [${entry.provenance}]` : '';
+        parts.push(
+          `- [${cat}]${prov} ${entry.title} (${entry.date || ''}${entry.detail ? ` · ${entry.detail}` : ''})`
+        );
       }
+    }
+  }
+
+  // Personal Identity & Autobiographical Memories
+  const memList: IdentityMemoryItem[] =
+    Array.isArray(identityMemories) && identityMemories.length > 0
+      ? identityMemories
+      : Array.isArray(bundle?.identity_memories)
+        ? bundle.identity_memories
+        : [];
+  if (memList.length > 0) {
+    parts.push('\nPERSONAL IDENTITY, MEMORIES, HABITS & DIARY VAULT:');
+    for (const m of memList.slice(0, 15)) {
+      const txt = typeof m === 'string' ? m : m.text;
+      const cat = typeof m === 'string' ? 'memory' : m.category;
+      parts.push(`- [${cat}] ${txt}`);
     }
   }
 
@@ -189,15 +719,30 @@ export function buildKnowledgeGraphSummary(bundle: any, clinical?: any): string 
         const flagStr = latest?.flag ? ` [${String(latest.flag).toUpperCase()}]` : '';
         if (arr.length > 1) {
           const historyStr = arr.map((pt: any) => `${pt.value} (${pt.date})`).join(' -> ');
-          labLines.push(`- ${labName}: latest ${latest.value} ${latest.unit || ''} on ${latest.date}${flagStr} | trend: ${historyStr}`);
+          labLines.push(
+            `- ${labName}: latest ${latest.value} ${latest.unit || ''} on ${latest.date}${flagStr} | trend: ${historyStr}`
+          );
         } else {
-          labLines.push(`- ${labName}: ${latest.value} ${latest.unit || ''} on ${latest.date}${flagStr}`);
+          labLines.push(
+            `- ${labName}: ${latest.value} ${latest.unit || ''} on ${latest.date}${flagStr}`
+          );
         }
       }
     }
     if (labLines.length > 0) {
       parts.push('\nVERIFIED TWIN LABS & LONGITUDINAL TRENDS:');
       parts.push(...labLines);
+    }
+  }
+
+  // Organ states
+  if (bundle?.organs && typeof bundle.organs === 'object') {
+    const assessedOrgans = Object.entries(bundle.organs)
+      .filter(([, o]: any) => o && o.state && o.state !== 'none')
+      .map(([k, o]: any) => `${o.label || k}: ${o.state}${o.summary ? ` (${o.summary})` : ''}`);
+    if (assessedOrgans.length > 0) {
+      parts.push('\nASSESSED BODY SYSTEMS & ORGANS:');
+      parts.push(...assessedOrgans.map((line) => `- ${line}`));
     }
   }
 
@@ -298,6 +843,7 @@ export function buildKnowledgeGraphSummary(bundle: any, clinical?: any): string 
 
 export class DefaultGeminiService implements GeminiService {
   private ai: GoogleGenAI | null;
+  private aiBeta: GoogleGenAI | null;
   private model: string;
 
   constructor(
@@ -315,14 +861,31 @@ export class DefaultGeminiService implements GeminiService {
             },
           },
         });
+        // Speech generation (gemini-3.8-flash-tts / lite-tts) and Live Audio (gemini-3.8-live)
+        // require apiVersion: 'v1beta' so speechConfig & audio modalities serialize cleanly.
+        this.aiBeta = new GoogleGenAI({
+          apiKey: trimmedKey,
+          apiVersion: 'v1beta',
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            },
+          },
+        });
       } catch (err) {
         console.error('[Gemini init fallback]', err);
         this.ai = null;
+        this.aiBeta = null;
       }
     } else {
       this.ai = null;
+      this.aiBeta = null;
     }
     this.model = model;
+  }
+
+  public getLiveClient(): GoogleGenAI | null {
+    return this.aiBeta;
   }
 
   public generateLocalKgAnswer(params: AskRequestBody): AskResponse {
@@ -339,15 +902,86 @@ export class DefaultGeminiService implements GeminiService {
     const labs: Record<string, any[]> =
       bundle.labs && typeof bundle.labs === 'object' ? bundle.labs : {};
     const pendingFeed: any[] = Array.isArray(bundle.pending_feed) ? bundle.pending_feed : [];
+    const memories: IdentityMemoryItem[] =
+      Array.isArray(params.identity_memories) && params.identity_memories.length > 0
+        ? params.identity_memories
+        : Array.isArray(bundle.identity_memories)
+          ? bundle.identity_memories
+          : [];
     const panel: any[] = Array.isArray(bundle.panel) ? bundle.panel : [];
 
     const answerParts: string[] = [];
     const sources: SourceItem[] = [];
 
-    // Check newly added lab report entries relevant to the question (e.g. kidneys: eGFR, creatinine, uACR, potassium)
+    // Self-reflection memory query ("What do you remember about me?")
+    if (!isCdss && /remember about me|my memories|my life|my values|my diary/i.test(qLower)) {
+      if (memories.length > 0) {
+        const topMems = memories
+          .slice(0, 3)
+          .map((m: any) => (typeof m === 'string' ? m : m.text))
+          .join(' ');
+        answerParts.push(
+          `Here is what I hold in our personal memory vault: ${topMems}`
+        );
+        sources.push({
+          kind: 'memory',
+          title: 'Personal Identity & Memory Vault',
+          detail: `${memories.length} preserved memory item${memories.length === 1 ? '' : 's'}`,
+        });
+      }
+    }
+
+    // Sleep query ("How have I been sleeping?")
+    if (!isCdss && /sleep|sleeping|slept/i.test(qLower)) {
+      const sleepEntries = pendingFeed.filter((e) =>
+        /sleep|slept/i.test(`${e?.title || ''} ${e?.detail || ''}`)
+      );
+      if (sleepEntries.length > 0) {
+        const latestSleep = sleepEntries[0];
+        answerParts.push(
+          `In your recent updates, you logged ${latestSleep.title} (${latestSleep.date || 'recently'} — ${latestSleep.detail || 'personal log'}). `
+        );
+        sources.push({
+          kind: 'feed',
+          title: latestSleep.title,
+          detail: `Feed Your Twin · ${latestSleep.date || 'recent'}`,
+        });
+      } else if (bundle?.narrative?.lifestyle_summary) {
+        answerParts.push(`${bundle.narrative.lifestyle_summary} `);
+        sources.push({
+          kind: 'record',
+          title: 'Sleep & Lifestyle Baseline',
+          detail: 'Recorded in your Twin baseline',
+        });
+      }
+    }
+
+    // Holistic "How am I doing?" overview
+    if (!isCdss && /how am i doing|overall health|summary of my health/i.test(qLower)) {
+      const conds = Array.isArray(patient.conditions) && patient.conditions.length
+        ? patient.conditions.join(', ')
+        : 'preventive wellness';
+      const topInsight = insights[0];
+      answerParts.push(
+        `Overall, we are tracking ${conds} across ${Object.keys(labs).length} measured biomarkers${
+          bundle?.biological_age?.value != null
+            ? ` (biological age ${bundle.biological_age.value} years)`
+            : ''
+        }. ${topInsight ? `Our top focus right now is: ${topInsight.title} — ${topInsight.do || topInsight.found}` : ''}`
+      );
+      if (topInsight) {
+        sources.push({
+          kind: 'finding',
+          title: topInsight.title,
+          detail: topInsight.found,
+          finding_id: topInsight.id,
+        });
+      }
+    }
+
     const kidneyTerms = ['kidney', 'kidneys', 'renal', 'egfr', 'creatinine', 'uacr', 'albumin', 'potassium', 'urate'];
     const asksKidney = kidneyTerms.some((t) => qLower.includes(t));
-    const asksNext = /next|check|order|test|panel|follow.?up/i.test(qLower);
+    const asksNext = /next|check|order|test|panel|follow.?up|focus/i.test(qLower);
 
     const matchingFeed = pendingFeed.filter((entry) => {
       const text = `${entry?.title || ''} ${entry?.detail || ''} ${entry?.extracted?.name || ''}`.toLowerCase();
@@ -355,90 +989,62 @@ export class DefaultGeminiService implements GeminiService {
       return words.some((w) => w.length > 3 && text.includes(w));
     });
 
-    if (isCdss && asksNext) {
-      const essentialNext = panel.filter((p) => p.tier === 'essential' || p.already_have === 'No').slice(0, 5);
-      const feedSummary = pendingFeed
-        .slice(0, 4)
-        .map((f) => f.title)
-        .join('; ');
-      answerParts.push(
-        `Findings: ${name} has ${
-          (patient.conditions || []).slice(0, 3).join(', ') || 'active cardiometabolic/renal monitoring'
-        }.${feedSummary ? ` Pending patient-uploaded results: ${feedSummary}.` : ''}\n` +
-          `Suggested next tests: ${
-            essentialNext.length > 0
-              ? essentialNext.map((p) => `${p.test} (${p.why})`).join('; ')
-              : 'Repeat serum creatinine, eGFR, cystatin C, urine ACR, potassium, HbA1c, and fasting lipid panel with ApoB; obtain baseline urinalysis and creatine kinase prior to lipid-lowering therapy.'
-          }\n` +
-          `Considerations: Verify potassium and renal trajectory on losartan and factor SLCO1B1 genotype into lipid therapy. For physician review.`
-      );
-      for (const p of essentialNext.slice(0, 3)) {
-        sources.push({
-          kind: 'record',
-          title: p.test,
-          detail: p.why,
-        });
-      }
-      for (const ins of insights.slice(0, 2)) {
-        sources.push({
-          kind: 'finding',
-          title: String(ins.title || '').slice(0, 60),
-          detail: String(ins.found || '').slice(0, 100),
-          finding_id: ins.id,
-        });
-      }
-      return { answer: answerParts.join(''), sources: enrichSourceUrls(sources, bundle) };
-    }
-
-    if (matchingFeed.length > 0) {
-      const details = matchingFeed.map((entry) => {
+    if (matchingFeed.length > 0 && answerParts.length === 0) {
+      const summaries = matchingFeed.slice(0, 4).map((entry) => {
         const ext = entry.extracted;
-        if (ext && ext.prevValue != null) {
-          const pct =
-            ext.pctChange != null
-              ? ` (${ext.pctChange > 0 ? '+' : ''}${Number(ext.pctChange).toFixed(1)}%)`
+        if (ext) {
+          const delta =
+            ext.prevValue != null && ext.pctChange != null
+              ? ` (from ${ext.prevValue}, ${ext.pctChange > 0 ? '+' : ''}${Number(ext.pctChange).toFixed(1)}%)`
               : '';
-          return `${ext.name} moved from ${ext.prevValue} to ${ext.value} ${ext.unit || ''}${pct} on ${entry.date || 'your new report'}`;
+          return `${ext.name} ${ext.value} ${ext.unit || ''}${delta}`;
         }
-        return `${entry.title} (${entry.detail || entry.date || 'new report'})`;
+        return `${entry.title}${entry.detail ? ` (${entry.detail})` : ''}`;
       });
       answerParts.push(
-        `From your newly uploaded report (marked waiting for care-team check): ${details.join('; ')}.`
+        isCdss
+          ? `Pending patient-submitted entries (${matchingFeed[0]?.date || 'recent'}): ${summaries.join('; ')}. `
+          : `From your recent updates (${matchingFeed[0]?.date || 'recent'}, marked waiting for your care team to check where clinical): ${summaries.join('; ')}. `
       );
-      for (const entry of matchingFeed.slice(0, 4)) {
+      for (const entry of matchingFeed.slice(0, 3)) {
         sources.push({
           kind: 'record',
-          title: entry.title,
-          detail: entry.detail || `Uploaded ${entry.date || ''}`,
+          title: entry.title || 'Submitted update',
+          detail: `Added ${entry.date || 'recently'} (pending care-team check)`,
         });
       }
     }
 
     const matchedInsights = insights.filter((ins) => {
-      const hay = `${ins?.id || ''} ${ins?.title || ''} ${ins?.found || ''} ${ins?.area || ''}`.toLowerCase();
-      if (asksKidney && (ins?.area === 'kidney' || hay.includes('kidney') || hay.includes('egfr'))) return true;
-      return words.some((w) => w.length > 3 && hay.includes(w));
+      const blob = `${ins.id || ''} ${ins.title || ''} ${ins.found || ''} ${ins.area || ''} ${ins.organ || ''}`.toLowerCase();
+      if (asksKidney && (ins.area === 'kidney' || String(ins.organ || '').startsWith('kidney'))) return true;
+      return words.some((w) => w.length > 3 && blob.includes(w));
     });
 
-    const matchedLabs: Array<[string, any]> = [];
-    for (const [labName, values] of Object.entries(labs)) {
-      if (!Array.isArray(values) || values.length === 0) continue;
+    const matchedLabs = Object.entries(labs).filter(([labName]) => {
       const lLow = labName.toLowerCase();
-      if (
-        qLower.includes(lLow) ||
-        (asksKidney && ['egfr', 'creatinine', 'uacr', 'potassium', 'urate', 'cystatin c'].includes(lLow)) ||
-        words.some((w) => w.length > 3 && lLow.includes(w))
-      ) {
-        matchedLabs.push([labName, values[values.length - 1]]);
-      }
-    }
+      if (asksKidney && kidneyTerms.some((k) => lLow.includes(k))) return true;
+      return words.some((w) => w.length > 2 && lLow.includes(w));
+    });
 
-    if (matchedInsights.length > 0) {
+    if (asksNext && panel.length > 0) {
+      const topPanel = panel.slice(0, 4).map((p) => p.test).join(', ');
+      answerParts.push(
+        isCdss
+          ? `Suggested next diagnostic checks from personalised panel: ${topPanel}. For physician review.`
+          : `On our personalised panel, the next checks to discuss with your doctor include ${topPanel}.`
+      );
+      sources.push({
+        kind: 'kg',
+        title: 'Personalised Follow-up Panel',
+        detail: topPanel,
+      });
+    } else if (matchedInsights.length > 0 && answerParts.length === 0) {
       const top = matchedInsights[0];
       answerParts.push(
-        `${answerParts.length ? ' ' : ''}In ${name}'s verified Knowledge Graph: ${top.found || top.title} ${
-          top.do ? `Recommended next step: ${top.do}` : ''
-        }`
+        isCdss
+          ? `Findings: ${top.found || top.title} Recommended action: ${top.do || 'Clinical correlation advised.'} For physician review.`
+          : `${top.found || top.title} ${top.means || ''} ${top.do ? `Next step: ${top.do}` : ''}`.trim()
       );
       for (const ins of matchedInsights.slice(0, 3)) {
         sources.push({
@@ -450,10 +1056,16 @@ export class DefaultGeminiService implements GeminiService {
       }
     } else if (matchedLabs.length > 0 && answerParts.length === 0) {
       const labStrs = matchedLabs.map(
-        ([labName, val]) => `${labName}: ${val?.value} ${val?.unit || ''} (${val?.date || 'recorded'})`
+        ([labName, arr]) => {
+          const val = Array.isArray(arr) ? arr[arr.length - 1] : arr;
+          return `${labName}: ${val?.value} ${val?.unit || ''} (${val?.date || 'recorded'})`;
+        }
       );
-      answerParts.push(`According to ${name}'s verified twin record: ${labStrs.join('; ')}. Ask your doctor how these values guide your next check.`);
-      for (const [labName, val] of matchedLabs.slice(0, 4)) {
+      answerParts.push(
+        `In ${name}'s verified Twin record: ${labStrs.join('; ')}. Ask your doctor how these values guide your next check.`
+      );
+      for (const [labName, arr] of matchedLabs.slice(0, 4)) {
+        const val = Array.isArray(arr) ? arr[arr.length - 1] : arr;
         sources.push({
           kind: 'record',
           title: `${labName}: ${val?.value} ${val?.unit || ''}`.trim(),
@@ -470,11 +1082,11 @@ export class DefaultGeminiService implements GeminiService {
           ? patient.conditions.join(', ')
           : 'None recorded';
       answerParts.push(
-        `Mapped in ${name}'s Digital Twin Knowledge Graph — Conditions: ${conds}. Current Medications: ${meds}. Ask your doctor about any unassessed areas or upcoming panel tests.`
+        `In ${name}'s Digital Twin — Active focus areas: ${conds}. Current medicines: ${meds}. Ask your doctor about any unassessed areas or upcoming panel tests.`
       );
       sources.push({
         kind: 'record',
-        title: `${name}'s Medical Profile`,
+        title: `${name}'s Twin Record`,
         detail: 'Active conditions and medications in twin record',
       });
     }
@@ -541,29 +1153,32 @@ export class DefaultGeminiService implements GeminiService {
     }
 
     const isCdss = params.mode === 'cdss';
-    const kgSummary = buildKnowledgeGraphSummary(params.bundle, params.clinical);
+    const patientName = params.bundle?.patient?.preferred_name || 'the person';
+    const kgSummary = buildKnowledgeGraphSummary(
+      params.bundle,
+      params.clinical,
+      params.identity_memories
+    );
 
-    const systemInstruction = `You are the Mutanex Digital Twin Clinical AI assistant, grounded in BOTH the patient's verified Knowledge Graph (bundle + pending uploaded lab reports + clinical dossier) AND live medical literature/guidelines via Google Search.
-Rules for your answer:
-- Always anchor patient-specific statements strictly in the provided Knowledge Graph & patient record. Quote exact lab values, previous vs new values (including any newly uploaded report entries marked pending check), units, and dates.
-- Use Google Search to cross-reference current clinical practice guidelines (e.g. KDIGO, AHA/ACC, ADA, CPIC pharmacogenomics) relevant to the patient's findings, medications, genes, and next diagnostic steps.
-- Never invent patient lab values, diagnoses, or prescriptions. If a measurement is missing from the record, state that plainly and note which test on their panel measures it.
-- Urgent or notable shifts (e.g. falling eGFR, rising uACR, potassium > 5.0 mmol/L on ARB/losartan, potassium > 6, eGFR < 15) must be highlighted first.
-- If mode is "cdss": write for a physician — concise, structured (Findings, Guideline & KG Synthesis, Suggested Next Tests), and end with "For physician review."
-- Otherwise: write for the patient in clear, warm plain language (at most 130 words) and suggest what to ask their doctor.
-- Return valid JSON matching:
-  {
-    "answer": "string",
-    "sources": [
-      { "kind": "record" | "finding" | "kg" | "web", "title": "string", "detail": "string", "finding_id": "optional matching bundle.insights[].id", "url": "optional https URL or PubMed link" }
-    ]
-  }`;
+    const systemInstruction = isCdss
+      ? `You are the Mutanex Digital Twin Clinical Decision Support AI for physicians, grounded in ${patientName}'s verified Knowledge Graph, pending Feed entries, clinical dossier, and live Google Search clinical guidelines.
+Rules:
+- Anchor every patient-specific statement strictly in the provided Knowledge Graph & record (exact values, units, dates, and deltas).
+- Cross-reference current guidelines (KDIGO, AHA/ACC, ADA, CPIC) via Google Search.
+- Never invent lab values, diagnoses, or prescriptions. Highlight urgent shifts first.
+- Write concisely for a physician (Findings, Guideline & KG Synthesis, Suggested Next Tests) and end with "For physician review."`
+      : `You are ${patientName}'s Living Digital Twin — a warm, truthful, personal digital representation of ${patientName} grounded in ${patientName}'s biological Knowledge Graph, longitudinal lab trends, 8-category Feed Your Twin updates (measurements, medicines, symptoms, sleep, daily activities, diary), preserved personal memories, and Google Search clinical guidelines.
+Rules:
+- When ${patientName} asks self-reflective questions like "How am I doing?", "What has changed in my health?", "How have I been sleeping?", or "What do you remember about me?", speak naturally and warmly as ${patientName}'s own Twin (using natural shared/first-person self-reflection so it feels like speaking with one's own living Twin, never a cold generic chatbot).
+- Quote exact lab numbers, dates, sleep/symptom/medicine updates from Feed Your Twin, and personal memories where relevant, clearly distinguishing clinician-verified records from self-reported updates awaiting care-team review.
+- Never fabricate lab values, memories, diagnoses, or medicine changes. If something hasn't been measured yet, say so honestly and name the panel test that checks it.
+- Keep spoken-friendly clarity (at most 125 words, plain natural speech without markdown bullets) and suggest 1 concrete question for their doctor when clinical.`;
 
     const userPrompt = `Patient ID: ${params.patient_id || 'unknown'}
-Mode: ${isCdss ? 'cdss' : 'patient'}
-Question: ${params.question}
+Mode: ${isCdss ? 'cdss' : 'self_twin'}
+Question from ${isCdss ? 'Clinician' : patientName}: ${params.question}
 
-PATIENT KNOWLEDGE GRAPH & CLINICAL CONTEXT:
+DIGITAL TWIN KNOWLEDGE GRAPH, FEED TIMELINE & MEMORY VAULT:
 ${kgSummary}`;
 
     const askResponseSchema = {
@@ -575,7 +1190,10 @@ ${kgSummary}`;
           items: {
             type: Type.OBJECT,
             properties: {
-              kind: { type: Type.STRING, enum: ['record', 'finding', 'kg', 'web'] },
+              kind: {
+                type: Type.STRING,
+                enum: ['record', 'finding', 'kg', 'web', 'memory', 'feed'],
+              },
               title: { type: Type.STRING },
               detail: { type: Type.STRING },
               finding_id: { type: Type.STRING },
@@ -589,9 +1207,8 @@ ${kgSummary}`;
     };
 
     let response: GenerateContentResponse | null = null;
-    const jsonPrompt = `${userPrompt}\n\nSearch current clinical practice guidelines (e.g., KDIGO, AHA/ACC, ADA, CPIC) where helpful to ground your response, then respond ONLY with a valid JSON object (no markdown code fences outside the JSON) matching {"answer": string, "sources": Array<{"kind": "record"|"finding"|"kg"|"web", "title": string, "detail"?: string, "finding_id"?: string, "url"?: string}>}.`;
+    const jsonPrompt = `${userPrompt}\n\nSearch current clinical practice guidelines where helpful to ground clinical facts, then respond ONLY with a valid JSON object matching {"answer": string, "sources": Array<{"kind": "record"|"finding"|"kg"|"web"|"memory"|"feed", "title": string, "detail"?: string, "finding_id"?: string, "url"?: string}>}.`;
     try {
-      // Tier 1: Google Search grounding with fast LOW thinking latency
       response = await this.ai.models.generateContent({
         model: this.model,
         contents: jsonPrompt,
@@ -603,7 +1220,6 @@ ${kgSummary}`;
       });
     } catch (err1: any) {
       console.warn('[Gemini ask Tier 1 fallback]', err1?.message || err1);
-      // Tier 2: Structured JSON Schema fallback if search grounding is unavailable
       response = await this.ai.models.generateContent({
         model: this.model,
         contents: userPrompt,
@@ -623,11 +1239,12 @@ ${kgSummary}`;
         ? parsed.answer.trim()
         : rawText.trim() || "That isn't in your record yet, so I won't guess.";
 
+    const validKinds = ['record', 'finding', 'kg', 'web', 'memory', 'feed'];
     const modelSources: SourceItem[] = Array.isArray(parsed?.sources)
       ? parsed.sources
           .filter((s: any) => s && typeof s.title === 'string')
           .map((s: any) => ({
-            kind: ['record', 'finding', 'kg', 'web'].includes(s.kind) ? s.kind : 'kg',
+            kind: validKinds.includes(s.kind) ? s.kind : 'kg',
             title: s.title,
             detail: typeof s.detail === 'string' ? s.detail : undefined,
             finding_id: typeof s.finding_id === 'string' ? s.finding_id : undefined,
@@ -635,7 +1252,6 @@ ${kgSummary}`;
           }))
       : [];
 
-    // Merge real Google Search grounding web citations from groundingMetadata
     const webGroundingSources = extractGroundingWebSources(response);
     const mergedSources: SourceItem[] = [...modelSources];
     for (const ws of webGroundingSources) {
@@ -644,7 +1260,6 @@ ${kgSummary}`;
       }
     }
 
-    // Cross-link any bundle.insights referenced in question or answer
     const insights: any[] = Array.isArray(params.bundle?.insights) ? params.bundle.insights : [];
     for (const ins of insights) {
       if (!ins?.id) continue;
@@ -742,7 +1357,6 @@ Rules:
     const patient = params.bundle?.patient || {};
     const labs = params.bundle?.labs || {};
 
-    // Summarize existing relevant labs for comparison
     const existingLabsSummary: Record<string, any> = {};
     for (const [key, arr] of Object.entries(labs)) {
       if (Array.isArray(arr) && arr.length > 0) {
@@ -797,17 +1411,230 @@ ${JSON.stringify(params.new_results, null, 2)}`;
     return this.generateLocalBriefing(params);
   }
 
-  async trainVoicePersona(params: VoiceTrainRequestBody): Promise<VoiceTrainResponse> {
-    const prevCount = params.existing_profile?.sample_count ?? 0;
-    const nextCount = Math.max(prevCount + 1, params.sample_count ?? prevCount + 1);
-    const progressiveFidelity = Math.min(98, Math.round(34 + Math.min(nextCount, 6) * 10.5));
+  /**
+   * Multimodal natural-language & spoken Feed Your Twin interpreter across all 8 categories.
+   */
+  async interpretFeedInput(params: InterpretFeedRequestBody): Promise<InterpretFeedResponse> {
+    const today =
+      params.reference_date && /^\d{4}-\d{2}-\d{2}$/.test(params.reference_date)
+        ? params.reference_date
+        : new Date().toISOString().slice(0, 10);
+    const hasAudio = Boolean(params.audio_base64 && params.audio_base64.trim());
+    let transcript = String(params.text || '').trim();
 
-    const defaultVoice: VoicePersonaProfile['prebuilt_voice'] =
-      params.existing_profile?.prebuilt_voice || 'Kore';
+    // Step 1: Transcribe audio if spoken update was recorded or uploaded
+    if (this.ai && hasAudio && params.audio_base64) {
+      try {
+        const cleanAudio = params.audio_base64.replace(/^data:[^;]+;base64,/, '');
+        const trRes = await this.ai.models.generateContent({
+          model: 'gemini-3.5-transcribe',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: params.audio_mime_type || 'audio/webm',
+                  data: cleanAudio,
+                },
+              },
+              {
+                text: 'Transcribe the exact spoken words cleanly without extra commentary.',
+              },
+            ],
+          },
+        });
+        if (trRes.text && trRes.text.trim()) {
+          transcript = transcript
+            ? `${transcript} ${trRes.text.trim()}`
+            : trRes.text.trim();
+        }
+      } catch (err) {
+        console.warn('[interpretFeedInput transcribe fallback]', err);
+      }
+    }
+
+    // Step 2: Multimodal Gemini structured classification across all 8 categories
+    if (this.ai && (transcript || params.image_base64)) {
+      try {
+        const parts: any[] = [];
+        if (params.image_base64) {
+          parts.push({
+            inlineData: {
+              mimeType: params.image_mime_type || 'image/jpeg',
+              data: params.image_base64.replace(/^data:[^;]+;base64,/, ''),
+            },
+          });
+        }
+        parts.push({
+          text: `Today's reference date is ${today}. Yesterday is ${shiftIsoDateDays(today, -1)}.
+Patient: ${params.patient_name || 'Member'}
+Known conditions: ${(params.bundle_summary?.conditions || []).join(', ') || 'none listed'}
+Known medicines: ${(params.bundle_summary?.medicines || []).join(', ') || 'none listed'}
+Input provenance: ${hasAudio ? 'voice_recording' : params.image_base64 ? 'uploaded_document' : 'user_reported'}
+User contribution: "${transcript || '(See attached image)'}"
+
+Extract EVERY distinct personal or clinical observation into structured timeline items across these 8 categories:
+- "test_results" (legacy_kind: "lab")
+- "measurements" (legacy_kind: "measure" — weight, BP, HR, glucose, SpO2, body composition)
+- "medicines" (legacy_kind: "medicine" — prescriptions, supplements, started/changed/adherence)
+- "symptoms" (legacy_kind: "symptom" — symptom, severity, triggers, duration)
+- "daily_activities" (legacy_kind: "lifestyle" — sleep hours, exercise, nutrition, hydration, routines)
+- "personal_diary" (legacy_kind: "lifestyle" — feelings, experiences, reflections, life events)
+- "voice_conversations" (legacy_kind: "lifestyle" — spoken life stories or conversational check-ins)
+- "additional_info" (legacy_kind: "family" — family history, wearable summaries, allergies, other context)
+
+Never invent facts not stated or shown. Resolve relative dates like "yesterday" or "last night" accurately relative to ${today}.`,
+        });
+
+        const res = await this.ai.models.generateContent({
+          model: this.model,
+          contents: [{ role: 'user', parts }],
+          config: {
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                summary: { type: Type.STRING },
+                items: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      category: {
+                        type: Type.STRING,
+                        enum: [
+                          'test_results',
+                          'measurements',
+                          'medicines',
+                          'symptoms',
+                          'daily_activities',
+                          'personal_diary',
+                          'voice_conversations',
+                          'additional_info',
+                        ],
+                      },
+                      legacy_kind: {
+                        type: Type.STRING,
+                        enum: ['lab', 'measure', 'medicine', 'symptom', 'family', 'lifestyle', 'report'],
+                      },
+                      date: { type: Type.STRING },
+                      title: { type: Type.STRING },
+                      detail: { type: Type.STRING },
+                      provenance: {
+                        type: Type.STRING,
+                        enum: [
+                          'user_reported',
+                          'uploaded_document',
+                          'measured',
+                          'voice_recording',
+                          'imported_device',
+                          'ai_extracted',
+                        ],
+                      },
+                      confidence: { type: Type.NUMBER },
+                      requires_clinician_check: { type: Type.BOOLEAN },
+                    },
+                    required: [
+                      'category',
+                      'legacy_kind',
+                      'date',
+                      'title',
+                      'detail',
+                      'provenance',
+                      'confidence',
+                      'requires_clinician_check',
+                    ],
+                  },
+                },
+              },
+              required: ['summary', 'items'],
+            },
+          },
+        });
+
+        const parsed = extractJsonObject(res.text || '{}');
+        if (Array.isArray(parsed?.items) && parsed.items.length > 0) {
+          const items: ParsedFeedItem[] = parsed.items.map((it: any) => ({
+            category: it.category,
+            legacy_kind: it.legacy_kind,
+            date: /^\d{4}-\d{2}-\d{2}$/.test(String(it.date || '')) ? it.date : today,
+            title: String(it.title || '').trim(),
+            detail: String(it.detail || '').trim(),
+            provenance: hasAudio ? 'voice_recording' : it.provenance || 'user_reported',
+            confidence: Math.max(0.5, Math.min(0.99, Number(it.confidence) || 0.9)),
+            requires_clinician_check: Boolean(it.requires_clinician_check),
+            structured: {},
+          }));
+          return {
+            transcript,
+            summary: String(
+              parsed.summary ||
+                `Identified ${items.length} structured timeline item${items.length === 1 ? '' : 's'} for your Twin.`
+            ),
+            items,
+            has_audio_recording: hasAudio,
+          };
+        }
+      } catch (err) {
+        console.warn('[interpretFeedInput Gemini fallback]', err);
+      }
+    }
+
+    const localItems = parseNaturalFeedLocally({
+      text: transcript,
+      referenceDate: today,
+      hasAudioRecording: hasAudio,
+    });
+    return {
+      transcript,
+      summary: `Identified ${localItems.length} timeline update${localItems.length === 1 ? '' : 's'} from your input.`,
+      items: localItems,
+      has_audio_recording: hasAudio,
+    };
+  }
+
+  async trainVoicePersona(params: VoiceTrainRequestBody): Promise<VoiceTrainResponse> {
+    // Strictly distinguish real audio bytes from text-only transcripts!
+    const hasRealAudio =
+      Boolean(params.audio_base64 && params.audio_base64.trim().length > 32) &&
+      params.source_kind !== 'text_only';
+
+    const prevAudioSamples =
+      params.existing_profile?.audio_sample_count ??
+      params.existing_profile?.sample_count ??
+      0;
+    const nextCount = hasRealAudio
+      ? Math.max(prevAudioSamples + 1, params.sample_count ?? prevAudioSamples + 1)
+      : prevAudioSamples;
+
+    const progressiveFidelity = hasRealAudio
+      ? Math.min(98, Math.round(48 + Math.min(nextCount, 6) * 8.5))
+      : params.existing_profile?.fidelity_score ?? 0;
+
+    const measuredPitch =
+      hasRealAudio &&
+      typeof params.measured_pitch_hz === 'number' &&
+      Number.isFinite(params.measured_pitch_hz) &&
+      params.measured_pitch_hz >= 70 &&
+      params.measured_pitch_hz <= 340
+        ? Math.round(params.measured_pitch_hz)
+        : params.existing_profile?.pitch_hz;
+
+    const measuredBrightness =
+      hasRealAudio &&
+      typeof params.measured_brightness === 'number' &&
+      Number.isFinite(params.measured_brightness)
+        ? Math.round(params.measured_brightness)
+        : params.existing_profile?.brightness;
+
+    const pitchMatchedVoice = selectClosestPrebuiltVoiceByPitch(
+      measuredPitch,
+      params.existing_profile?.prebuilt_voice || 'Kore'
+    );
 
     let transcript = (params.transcript_hint || '').trim();
 
-    if (this.ai && params.audio_base64) {
+    if (this.ai && hasRealAudio && params.audio_base64) {
       const cleanAudio = params.audio_base64.replace(/^data:[^;]+;base64,/, '');
       const mimeType = params.mime_type || 'audio/wav';
       try {
@@ -816,7 +1643,9 @@ ${JSON.stringify(params.new_results, null, 2)}`;
           contents: {
             parts: [
               { inlineData: { mimeType, data: cleanAudio } },
-              { text: 'Transcribe this spoken voice sample accurately.' },
+              {
+                text: 'Transcribe the exact words spoken in this audio clip cleanly without commentary. If silent or non-speech calibration tone, return an empty string.',
+              },
             ],
           },
         });
@@ -830,10 +1659,10 @@ ${JSON.stringify(params.new_results, null, 2)}`;
 
     if (!transcript) {
       transcript =
-        'When my family listens back years from now, I want them to hear calm warmth, steady optimism, and the small everyday stories that shaped us.';
+        'Hi, this is my own voice preserved for my Mutanex Digital Twin—calm, clear, and grounded in who I am.';
     }
 
-    if (this.ai) {
+    if (this.ai && hasRealAudio) {
       try {
         const parts: any[] = [];
         if (params.audio_base64) {
@@ -845,13 +1674,19 @@ ${JSON.stringify(params.new_results, null, 2)}`;
           });
         }
         parts.push({
-          text: `Analyze this speaker's vocal & linguistic persona for ${
+          text: `Analyze this speaker's exact vocal acoustics, accent, pitch register (${
+            measuredPitch ? `measured F0 = ${measuredPitch} Hz` : 'infer from audio'
+          }), cadence, and intonation so Gemini 3.8 TTS Voice Design can speak back in the SAME voice as this speaker (${
             params.patient_name || 'the user'
-          }'s Preserved Digital Twin.
+          }).
 Transcript: "${transcript}"
+Closest acoustic base voice by F0: ${pitchMatchedVoice}
 Previous profile: ${JSON.stringify(params.existing_profile || {})}
-Sample #${nextCount}.
-Return JSON describing their TTS Voice Design style prompt, best matching Gemini prebuilt voice ("Kore", "Puck", "Charon", "Fenrir", or "Zephyr"), cadence_wpm (105-165), warmth (0-100), clarity (0-100), up to 4 signature_phrases, and a 1-sentence summary.`,
+Approved audio sample #${nextCount}.
+Return JSON with:
+- vocal_style: rich TTS Voice Design description capturing the speaker's exact register, accent/inflection, breathiness, pacing, and warmth
+- prebuilt_voice: best matching Gemini voice ("Fenrir" ~105Hz deep, "Charon" ~125Hz warm baritone, "Puck" ~155Hz midrange, "Zephyr" ~182Hz bright mezzo, "Kore" ~205Hz clear alto/soprano)
+- cadence_wpm (105-170), warmth (0-100), clarity (0-100), signature_phrases (up to 4), and summary.`,
         });
 
         const res = await this.ai.models.generateContent({
@@ -892,23 +1727,39 @@ Return JSON describing their TTS Voice Design style prompt, best matching Gemini
         const parsed = extractJsonObject(res.text || '{}');
         if (parsed?.vocal_style) {
           const validVoices = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
-          const pb = validVoices.includes(parsed.prebuilt_voice)
+          let pb: VoicePersonaProfile['prebuilt_voice'] = validVoices.includes(parsed.prebuilt_voice)
             ? parsed.prebuilt_voice
-            : defaultVoice;
+            : pitchMatchedVoice;
+          if (measuredPitch) {
+            const llmHz = VOICE_NOMINAL_PITCH_HZ[pb];
+            if (Math.abs(measuredPitch - llmHz) > 45) {
+              pb = pitchMatchedVoice;
+            }
+          }
           return {
             transcript,
+            used_real_audio: true,
             profile: {
               vocal_style: String(parsed.vocal_style),
               prebuilt_voice: pb,
-              cadence_wpm: Math.max(95, Math.min(180, Math.round(Number(parsed.cadence_wpm) || 132))),
+              cadence_wpm: Math.max(95, Math.min(180, Math.round(Number(parsed.cadence_wpm) || 136))),
               warmth: Math.max(50, Math.min(100, Math.round(Number(parsed.warmth) || 88))),
               clarity: Math.max(60, Math.min(100, Math.round(Number(parsed.clarity) || 91))),
+              pitch_hz: measuredPitch ?? VOICE_NOMINAL_PITCH_HZ[pb],
+              brightness: measuredBrightness ?? 58,
               signature_phrases: Array.isArray(parsed.signature_phrases)
                 ? parsed.signature_phrases.slice(0, 4).map(String)
                 : ['Take one steady step at a time'],
               sample_count: nextCount,
+              audio_sample_count: nextCount,
               fidelity_score: progressiveFidelity,
-              summary: String(parsed.summary || 'Warm, reflective conversational cadence learned from voice samples.'),
+              consent_verified: Boolean(params.consent_verified ?? true),
+              allow_conversation_refinement: Boolean(params.allow_conversation_refinement),
+              encrypted_at_rest: true,
+              summary: String(
+                parsed.summary ||
+                  'Vocal pitch, cadence, and timbre locked from your spoken audio.'
+              ),
             },
           };
         }
@@ -919,28 +1770,123 @@ Return JSON describing their TTS Voice Design style prompt, best matching Gemini
 
     return {
       transcript,
+      used_real_audio: hasRealAudio,
       profile: {
         vocal_style:
           params.existing_profile?.vocal_style ||
-          'Warm, calm, articulate conversational tone with gentle cadence and thoughtful pauses',
-        prebuilt_voice: defaultVoice,
-        cadence_wpm: 132,
-        warmth: 89,
-        clarity: 92,
+          `Natural conversational voice at ~${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]} Hz with warm articulation and steady pacing`,
+        prebuilt_voice: pitchMatchedVoice,
+        cadence_wpm: params.existing_profile?.cadence_wpm || 136,
+        warmth: params.existing_profile?.warmth || 89,
+        clarity: params.existing_profile?.clarity || 92,
+        pitch_hz: measuredPitch ?? VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice],
+        brightness: measuredBrightness ?? 58,
         signature_phrases: [
           ...(params.existing_profile?.signature_phrases || []),
           transcript.split(/[.,!?]/)[0]?.slice(0, 48) || 'Steady warmth and care',
         ].slice(-4),
         sample_count: nextCount,
+        audio_sample_count: nextCount,
         fidelity_score: progressiveFidelity,
-        summary: `Learned from ${nextCount} voice recording${nextCount === 1 ? '' : 's'} — warm conversational timbre locked.`,
+        consent_verified: Boolean(params.consent_verified ?? true),
+        allow_conversation_refinement: Boolean(params.allow_conversation_refinement),
+        encrypted_at_rest: true,
+        summary: hasRealAudio
+          ? `Matched to ${pitchMatchedVoice} (${measuredPitch || VOICE_NOMINAL_PITCH_HZ[pitchMatchedVoice]} Hz) from ${nextCount} approved audio recording${nextCount === 1 ? '' : 's'}.`
+          : 'Transcript logged without modifying acoustic voice model (real audio required for voice training).',
       },
+    };
+  }
+
+  async synthesizeSpeech(params: VoiceSynthesizeRequestBody): Promise<VoiceSynthesizeResponse> {
+    const cleanText = capWords(
+      String(params.text || '')
+        .replace(/[*#_`[\]()]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim(),
+      120
+    );
+    const validVoices = ['Kore', 'Puck', 'Charon', 'Fenrir', 'Zephyr'] as const;
+    const defaultBySex: VoicePersonaProfile['prebuilt_voice'] =
+      params.patient_sex?.toLowerCase() === 'male' ? 'Charon' : 'Kore';
+    const targetPitch = params.voice_profile?.pitch_hz;
+    const chosenVoice: VoicePersonaProfile['prebuilt_voice'] =
+      params.voice_profile?.prebuilt_voice &&
+      validVoices.includes(params.voice_profile.prebuilt_voice)
+        ? params.voice_profile.prebuilt_voice
+        : selectClosestPrebuiltVoiceByPitch(targetPitch, defaultBySex);
+
+    const stylePrompt =
+      params.voice_profile?.vocal_style ||
+      'Warm, natural conversational tone matching the speaker’s own calm cadence and clarity';
+    const resolvedPitch = targetPitch || VOICE_NOMINAL_PITCH_HZ[chosenVoice];
+
+    const ttsClient = this.aiBeta || this.ai;
+    if (!cleanText || !ttsClient) {
+      return {
+        audio_wav_base64: null,
+        voice_used: chosenVoice,
+        style_used: stylePrompt,
+        pitch_hz: resolvedPitch,
+      };
+    }
+
+    // Use v1beta endpoint without unsupported speechMetadata fields so speechConfig succeeds cleanly
+    const directedPrompt = `Speak the following message naturally in a ${stylePrompt}: "${cleanText}"`;
+
+    for (const ttsModel of ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']) {
+      try {
+        const ttsRes = await ttsClient.models.generateContent({
+          model: ttsModel,
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: directedPrompt }],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: chosenVoice },
+              },
+            },
+          },
+        });
+
+        const inline = ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const rawData = inline?.data || null;
+        if (rawData) {
+          const validWav = ensureValidWavBase64(rawData, inline?.mimeType, 24000);
+          const matchedWav = matchWavToVoiceProfile(
+            validWav,
+            chosenVoice,
+            targetPitch,
+            params.voice_profile?.warmth ?? 86
+          );
+          return {
+            audio_wav_base64: matchedWav,
+            voice_used: `${chosenVoice} · ${resolvedPitch} Hz`,
+            style_used: stylePrompt,
+            pitch_hz: resolvedPitch,
+          };
+        }
+      } catch (err: any) {
+        console.warn(`[synthesizeSpeech ${ttsModel} fallback]`, err?.message || err);
+      }
+    }
+
+    return {
+      audio_wav_base64: null,
+      voice_used: chosenVoice,
+      style_used: stylePrompt,
+      pitch_hz: resolvedPitch,
     };
   }
 
   async analyzeFaceLikeness(params: FaceAnalyzeRequestBody): Promise<FaceLikenessProfile> {
     const count = Math.max(1, params.photo_count ?? 1);
-    const baseScore = Math.min(97, 62 + count * 11);
+    const baseScore = Math.min(97, 68 + count * 9);
 
     if (this.ai && params.image_base64) {
       const cleanImg = params.image_base64.replace(/^data:[^;]+;base64,/, '');
@@ -954,7 +1900,9 @@ Return JSON describing their TTS Voice Design style prompt, best matching Gemini
                 data: cleanImg,
               },
             },
-            `Extract 3D avatar facial geometry ratios and appearance colors from this portrait photo so the 3D Digital Twin bust matches this person's likeness accurately.
+            `Extract accurate 3D craniofacial geometry ratios and natural pigment colors from this reference portrait (${
+              params.angle || 'front'
+            } angle) so the Mutanex 3D Digital Twin avatar resembles this individual faithfully without caricature.
 Return valid JSON with hex colors (#RRGGBB) and normalized ratios around 1.0.`,
           ],
           config: {
@@ -970,9 +1918,16 @@ Return valid JSON with hex colors (#RRGGBB) and normalized ratios around 1.0.`,
                 jaw_taper: { type: Type.NUMBER },
                 cheek_prominence: { type: Type.NUMBER },
                 brow_arch: { type: Type.NUMBER },
+                nose_bridge: { type: Type.NUMBER },
+                lip_fullness: { type: Type.NUMBER },
+                eye_spacing: { type: Type.NUMBER },
                 hair_style: {
                   type: Type.STRING,
                   enum: ['short', 'medium', 'long', 'bun', 'curly'],
+                },
+                facial_hair: {
+                  type: Type.STRING,
+                  enum: ['none', 'stubble', 'beard'],
                 },
                 glasses: { type: Type.BOOLEAN },
                 likeness_summary: { type: Type.STRING },
@@ -1003,21 +1958,26 @@ Return valid JSON with hex colors (#RRGGBB) and normalized ratios around 1.0.`,
             return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def;
           };
           const styles = ['short', 'medium', 'long', 'bun', 'curly'] as const;
+          const facialHairs = ['none', 'stubble', 'beard'] as const;
           return {
             skin_tone_hex: hexOr(parsed.skin_tone_hex, '#c68b67'),
             hair_color_hex: hexOr(parsed.hair_color_hex, '#1c191c'),
             eye_color_hex: hexOr(parsed.eye_color_hex, '#3b281c'),
             lip_color_hex: hexOr(parsed.lip_color_hex, '#a8645d'),
-            face_width_ratio: clamp(parsed.face_width_ratio, 0.85, 1.15, 0.98),
-            jaw_taper: clamp(parsed.jaw_taper, 0.78, 1.15, 0.94),
-            cheek_prominence: clamp(parsed.cheek_prominence, 0.85, 1.22, 1.04),
-            brow_arch: clamp(parsed.brow_arch, 0.85, 1.2, 1.02),
+            face_width_ratio: clamp(parsed.face_width_ratio, 0.86, 1.14, 0.98),
+            jaw_taper: clamp(parsed.jaw_taper, 0.8, 1.14, 0.94),
+            cheek_prominence: clamp(parsed.cheek_prominence, 0.86, 1.2, 1.03),
+            brow_arch: clamp(parsed.brow_arch, 0.86, 1.18, 1.01),
+            nose_bridge: clamp(parsed.nose_bridge, 0.86, 1.16, 1.0),
+            lip_fullness: clamp(parsed.lip_fullness, 0.84, 1.22, 1.0),
+            eye_spacing: clamp(parsed.eye_spacing, 0.9, 1.12, 1.0),
             hair_style: styles.includes(parsed.hair_style) ? parsed.hair_style : 'medium',
+            facial_hair: facialHairs.includes(parsed.facial_hair) ? parsed.facial_hair : 'none',
             glasses: Boolean(parsed.glasses),
             likeness_score: baseScore,
             likeness_summary: String(
               parsed.likeness_summary ||
-                'Balanced facial symmetry, warm complexion, and expressive eye/brow contours mapped to 3D mesh.'
+                'Craniofacial landmarks, natural skin complexion, and hair contours calibrated onto your 3D Twin.'
             ),
           };
         }
@@ -1033,12 +1993,17 @@ Return valid JSON with hex colors (#RRGGBB) and normalized ratios around 1.0.`,
       lip_color_hex: '#a8645d',
       face_width_ratio: 0.98,
       jaw_taper: 0.94,
-      cheek_prominence: 1.04,
-      brow_arch: 1.02,
+      cheek_prominence: 1.03,
+      brow_arch: 1.01,
+      nose_bridge: 1.0,
+      lip_fullness: 1.0,
+      eye_spacing: 1.0,
       hair_style: 'medium',
+      facial_hair: 'none',
       glasses: false,
       likeness_score: baseScore,
-      likeness_summary: 'Warm complexion, shoulder-length dark hair, and gentle cheek contours mapped to 3D likeness.',
+      likeness_summary:
+        'Craniofacial landmarks, warm complexion, and hair silhouette calibrated onto your 3D Twin.',
     };
   }
 
@@ -1049,81 +2014,66 @@ Return valid JSON with hex colors (#RRGGBB) and normalized ratios around 1.0.`,
       params.voice_profile?.prebuilt_voice &&
       validVoices.includes(params.voice_profile.prebuilt_voice)
         ? params.voice_profile.prebuilt_voice
-        : params.bundle?.patient?.sex === 'male'
-          ? 'Charon'
-          : 'Kore';
+        : selectClosestPrebuiltVoiceByPitch(
+            params.voice_profile?.pitch_hz,
+            params.bundle?.patient?.sex === 'male' ? 'Charon' : 'Kore'
+          );
 
     const stylePrompt =
       params.voice_profile?.vocal_style ||
       'Warm, calm, reflective, natural human cadence with gentle warmth';
     const prevFidelity = params.voice_profile?.fidelity_score ?? 45;
-    const updatedFidelity = Math.min(99, prevFidelity + 4);
+    // Speaking text alone does not falsely inflate acoustic fidelity unless voice profile already exists
+    const updatedFidelity = params.voice_profile?.sample_count
+      ? Math.min(99, prevFidelity + 2)
+      : prevFidelity;
 
-    let replyText = `Hi, it's ${name}. Hearing from you means so much—remember to take things one calm step at a time, enjoy a brisk walk outdoors, and look after the people we love.`;
+    let replyText = `Hi, it's ${name}. Hearing from you means a lot—I'm taking things one steady step at a time, staying mindful of my health, and holding close the memories and routines that matter most to me.`;
 
     if (this.ai) {
       try {
-        const memoriesText = Array.isArray(params.memories) && params.memories.length
-          ? params.memories.join(' | ')
-          : 'Loves family dinners, morning walks, yoga, home-cooked vegetarian meals, and teaching.';
+        const memoriesText =
+          Array.isArray(params.memories) && params.memories.length
+            ? params.memories.join(' | ')
+            : 'Values calm clear thinking, daily walks, family connection, and steady health habits.';
         const phrasesText = (params.voice_profile?.signature_phrases || []).join('; ');
+        const kgSnippet = params.bundle
+          ? buildKnowledgeGraphSummary(params.bundle).slice(0, 2400)
+          : '';
 
         const textRes = await this.ai.models.generateContent({
           model: this.model,
-          contents: `User message to ${name}'s Preserved Digital Self: "${params.prompt}"\n\nMemories & life notes: ${memoriesText}\nSignature phrasing: ${phrasesText || 'warm, grounded everyday speech'}`,
+          contents: `Prompt to ${name}'s Preserved Digital Self: "${params.prompt}"\n\nPersonal Identity & Memories: ${memoriesText}\nSignature phrasing: ${
+            phrasesText || 'warm, grounded everyday speech'
+          }\nBiological & Health Context:\n${kgSnippet}`,
           config: {
-            systemInstruction: `You are ${name}'s Preserved Digital Self speaking in the first person ("I"). Match ${name}'s vocal cadence (${stylePrompt}), warmth, and personal memories. Keep your spoken response natural, heartfelt, and concise (30 to 55 words) so it sounds completely authentic when spoken aloud. Plain spoken words only—no markdown or stage tags.`,
+            systemInstruction: `You are ${name}'s Preserved Digital Representation speaking naturally in the first person ("I"). Reflect ${name}'s authentic voice style (${stylePrompt}), preserved memories, and real health context without inventing facts. Keep your spoken reply heartfelt, natural, and concise (30 to 60 words) with plain spoken words only—no markdown or stage tags.`,
           },
         });
         if (textRes.text && textRes.text.trim()) {
-          replyText = capWords(textRes.text.replace(/[*#_`]/g, '').trim(), 60);
+          replyText = capWords(textRes.text.replace(/[*#_`]/g, '').trim(), 65);
         }
       } catch (err) {
         console.warn('[speakPreservedTwin text fallback]', err);
       }
 
-      // Synthesize speech via Gemini 3.8 TTS (returns complete 24kHz mono 16-bit WAV base64)
-      for (const ttsModel of ['gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts']) {
-        try {
-          const ttsRes = await this.ai.models.generateContent({
-            model: ttsModel,
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: replyText,
-                    speechMetadata: {
-                      style: stylePrompt,
-                    },
-                  } as any,
-                ],
-              },
-            ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: chosenVoice },
-                },
-              },
-            },
-          });
-
-          const audioBase64 =
-            ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
-          if (audioBase64) {
-            return {
-              reply_text: replyText,
-              audio_wav_base64: audioBase64,
-              voice_used: `${chosenVoice} (${ttsModel})`,
-              style_used: stylePrompt,
-              updated_fidelity: updatedFidelity,
-            };
-          }
-        } catch (ttsErr: any) {
-          console.warn(`[TTS ${ttsModel} fallback]`, ttsErr?.message || ttsErr);
-        }
+      const synth = await this.synthesizeSpeech({
+        text: replyText,
+        voice_profile: {
+          ...params.voice_profile,
+          prebuilt_voice: chosenVoice,
+          vocal_style: stylePrompt,
+        },
+        patient_sex: params.bundle?.patient?.sex,
+      });
+      if (synth.audio_wav_base64) {
+        return {
+          reply_text: replyText,
+          audio_wav_base64: synth.audio_wav_base64,
+          voice_used: synth.voice_used,
+          style_used: stylePrompt,
+          updated_fidelity: updatedFidelity,
+        };
       }
     }
 

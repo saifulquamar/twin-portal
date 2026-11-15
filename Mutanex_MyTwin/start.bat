@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-start "" http://localhost:8080
+start "" http://localhost:3000
 python server.py || py server.py

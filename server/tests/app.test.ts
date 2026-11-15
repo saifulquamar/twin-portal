@@ -1,7 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app.ts';
-import { DefaultGeminiService, buildKnowledgeGraphSummary, type GeminiService } from '../src/gemini.ts';
+import {
+  DefaultGeminiService,
+  buildKnowledgeGraphSummary,
+  matchWavToVoiceProfile,
+  selectClosestPrebuiltVoiceByPitch,
+  type GeminiService,
+} from '../src/gemini.ts';
 import type { AskResponse, BriefingResponse, ExtractResponse } from '../src/types.ts';
 
 describe('Mutanex My Twin Server API', () => {
@@ -10,6 +16,7 @@ describe('Mutanex My Twin Server API', () => {
     extract: vi.fn(),
     briefing: vi.fn(),
     trainVoicePersona: vi.fn(),
+    synthesizeSpeech: vi.fn(),
     analyzeFaceLikeness: vi.fn(),
     speakPreservedTwin: vi.fn(),
   };
@@ -434,5 +441,193 @@ describe('Mutanex My Twin Server API', () => {
       expect(res.body.audio_wav_base64).toContain('UklGR');
     });
   });
+
+  describe('Matched-Voice Synthesis & Pitch Morphing DSP', () => {
+    it('selectClosestPrebuiltVoiceByPitch and matchWavToVoiceProfile morph 16-bit WAV pitch cleanly', () => {
+      expect(selectClosestPrebuiltVoiceByPitch(108)).toBe('Fenrir');
+      expect(selectClosestPrebuiltVoiceByPitch(154)).toBe('Puck');
+      expect(selectClosestPrebuiltVoiceByPitch(208)).toBe('Kore');
+
+      // Build a valid 24kHz 16-bit mono WAV buffer with 400 samples of a 200 Hz sine wave
+      const sampleRate = 24000;
+      const numSamples = 400;
+      const dataBytes = numSamples * 2;
+      const rawWav = Buffer.alloc(44 + dataBytes);
+      rawWav.write('RIFF', 0, 'ascii');
+      rawWav.writeUInt32LE(36 + dataBytes, 4);
+      rawWav.write('WAVE', 8, 'ascii');
+      rawWav.write('fmt ', 12, 'ascii');
+      rawWav.writeUInt32LE(16, 16);
+      rawWav.writeUInt16LE(1, 20);
+      rawWav.writeUInt16LE(1, 22);
+      rawWav.writeUInt32LE(sampleRate, 24);
+      rawWav.writeUInt32LE(sampleRate * 2, 28);
+      rawWav.writeUInt16LE(2, 32);
+      rawWav.writeUInt16LE(16, 34);
+      rawWav.write('data', 36, 'ascii');
+      rawWav.writeUInt32LE(dataBytes, 40);
+      for (let i = 0; i < numSamples; i++) {
+        const s = Math.round(12000 * Math.sin((2 * Math.PI * 200 * i) / sampleRate));
+        rawWav.writeInt16LE(s, 44 + i * 2);
+      }
+
+      const morphedB64 = matchWavToVoiceProfile(rawWav.toString('base64'), 'Kore', 180, 88);
+      const morphedBuf = Buffer.from(morphedB64, 'base64');
+      expect(morphedBuf.subarray(0, 4).toString('ascii')).toBe('RIFF');
+      expect(morphedBuf.subarray(8, 12).toString('ascii')).toBe('WAVE');
+      // Lowering pitch from Kore (205 Hz) to 180 Hz stretches sample count (ratio < 1 -> more output samples)
+      expect(morphedBuf.length).toBeGreaterThan(rawWav.length);
+    });
+  });
+
+  describe('Auth, RBAC Session Isolation, Encrypted Vault & Multimodal Feed Interpretation', () => {
+    it('supports Sign Up, Sign In, RBAC patient isolation, Admin access, and Sign Out', async () => {
+      const localApp = createApp(new DefaultGeminiService(''));
+
+      // 1. Sign up a new member bound to MX-SYN-T04
+      const signupRes = await request(localApp).post('/v1/auth/signup').send({
+        name: 'Rohan Desai',
+        email: `rohan.${Date.now()}@example.com`,
+        password: 'SecurePassword123',
+        bound_patient_id: 'MX-SYN-T04',
+      });
+      expect(signupRes.status).toBe(201);
+      expect(signupRes.body.token).toMatch(/^mxs_/);
+      expect(signupRes.body.user.role).toBe('member');
+      expect(signupRes.body.user.bound_patient_id).toBe('MX-SYN-T04');
+      const memberToken = signupRes.body.token;
+
+      // 2. Member can read & update their own encrypted vault (MX-SYN-T04)
+      const ownVaultPut = await request(localApp)
+        .put('/v1/preserve/vault/MX-SYN-T04')
+        .set('Authorization', `Bearer ${memberToken}`)
+        .send({
+          identity_memories: [
+            {
+              id: 'mem-1',
+              category: 'values',
+              text: 'I prioritize morning walks and steady sleep.',
+              created_at: '2026-11-14T10:00:00Z',
+              source: 'user_written',
+            },
+          ],
+        });
+      expect(ownVaultPut.status).toBe(200);
+      expect(ownVaultPut.body.identity_memories).toHaveLength(1);
+
+      // 3. Member CANNOT access another patient's vault (MX-SYN-T02 -> 403 Forbidden)
+      const crossVaultGet = await request(localApp)
+        .get('/v1/preserve/vault/MX-SYN-T02')
+        .set('Authorization', `Bearer ${memberToken}`);
+      expect(crossVaultGet.status).toBe(403);
+
+      // 4. Admin account CAN access any patient vault across all 12 profiles
+      const adminRes = await request(localApp)
+        .post('/v1/auth/admin-demo')
+        .send({ patient_id: 'MX-SYN-T02' });
+      expect(adminRes.status).toBe(200);
+      expect(adminRes.body.user.role).toBe('admin');
+
+      const adminVaultGet = await request(localApp)
+        .get('/v1/preserve/vault/MX-SYN-T04')
+        .set('Authorization', `Bearer ${adminRes.body.token}`);
+      expect(adminVaultGet.status).toBe(200);
+      expect(adminVaultGet.body.identity_memories[0].text).toContain('morning walks');
+
+      // 5. Consent revocation purges voice clips and voice profile immediately
+      await request(localApp)
+        .put('/v1/preserve/vault/MX-SYN-T04')
+        .set('Authorization', `Bearer ${memberToken}`)
+        .send({
+          voice_profile: {
+            vocal_style: 'calm',
+            prebuilt_voice: 'Charon',
+            cadence_wpm: 142,
+            warmth: 85,
+            clarity: 90,
+            signature_phrases: [],
+            sample_count: 2,
+            fidelity_score: 76,
+            summary: 'Matched Charon',
+          },
+          voice_clips: [
+            {
+              id: 'clip-1',
+              recorded_at: '2026-11-14T10:00:00Z',
+              source_kind: 'recorded_audio',
+              duration_sec: 5.2,
+              pitch_hz: 132,
+              snr_db: 28,
+              transcript: 'Hello Twin',
+            },
+          ],
+        });
+
+      const purgeRes = await request(localApp)
+        .delete('/v1/preserve/vault/MX-SYN-T04?scope=voice')
+        .set('Authorization', `Bearer ${memberToken}`);
+      expect(purgeRes.status).toBe(200);
+      expect(purgeRes.body.voice_profile).toBeNull();
+      expect(purgeRes.body.voice_clips).toEqual([]);
+      expect(purgeRes.body.voice_consent.granted).toBe(false);
+
+      // 6. Sign out invalidates the session token
+      const outRes = await request(localApp)
+        .post('/v1/auth/signout')
+        .set('Authorization', `Bearer ${memberToken}`);
+      expect(outRes.status).toBe(200);
+
+      const meAfter = await request(localApp)
+        .get('/v1/auth/me')
+        .set('Authorization', `Bearer ${memberToken}`);
+      expect(meAfter.body.authenticated).toBe(false);
+    });
+
+    it('enforces voice-vs-text safeguard: text_only never counts as real acoustic voice training', async () => {
+      const localSvc = new DefaultGeminiService('');
+      const textOnlyRes = await localSvc.trainVoicePersona({
+        source_kind: 'text_only',
+        transcript_hint: 'Typed message with zero audio bytes',
+        patient_name: 'Anika',
+      });
+      expect(textOnlyRes.used_real_audio).toBe(false);
+      expect(textOnlyRes.profile.audio_sample_count).toBe(0);
+
+      // Real audio buffer (>= 64 bytes) DOES count as acoustic voice training
+      const realAudioB64 = Buffer.alloc(320, 42).toString('base64');
+      const realAudioRes = await localSvc.trainVoicePersona({
+        audio_base64: realAudioB64,
+        mime_type: 'audio/wav',
+        source_kind: 'recorded_audio',
+        consent_verified: true,
+        measured_pitch_hz: 192,
+        patient_name: 'Anika',
+      });
+      expect(realAudioRes.used_real_audio).toBe(true);
+      expect(realAudioRes.profile.audio_sample_count).toBeGreaterThanOrEqual(1);
+    });
+
+    it('POST /v1/feed/interpret decomposes natural-language multi-entity updates into appropriate 8 categories', async () => {
+      const localApp = createApp(new DefaultGeminiService(''));
+      const res = await request(localApp)
+        .post('/v1/feed/interpret')
+        .send({
+          text: 'I had a headache yesterday, slept for only five hours, and started taking a new medicine.',
+          reference_date: '2026-11-14',
+          patient_name: 'Anika',
+        });
+
+      expect(res.status).toBe(200);
+      const cats = res.body.items.map((it: any) => it.category);
+      expect(cats).toContain('symptoms');
+      expect(cats).toContain('daily_activities');
+      expect(cats).toContain('medicines');
+
+      const symptomItem = res.body.items.find((it: any) => it.category === 'symptoms');
+      expect(symptomItem.date).toBe('2026-11-13'); // resolved "yesterday" relative to 2026-11-14
+      expect(symptomItem.provenance).toBe('user_reported');
+    });
+  });
 });
+
 

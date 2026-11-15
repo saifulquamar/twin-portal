@@ -81,8 +81,8 @@ In the Cloud Run Console (or via `--set-env-vars`), you can set:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `GEMINI_API_KEY` | *(empty)* | Optional. Enables Gemini 2.0 / 1.5 Flash AI assistant with Google Search grounding at `/v1/ask`. |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model name for the AI assistant. |
+| `GEMINI_API_KEY` | *(empty)* | Optional. Enables Gemini AI assistant with Google Search grounding at `/v1/ask`. |
+| `GEMINI_MODEL` | `gemini-4-hydrogen` | Gemini model name for the AI assistant. |
 | `PORT` | `8080` | Automatically injected by Google Cloud Run. |
 
 To update environment variables on an existing Cloud Run service:

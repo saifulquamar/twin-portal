@@ -24,10 +24,10 @@ mimetypes.add_type("application/manifest+json", ".webmanifest")
 mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("application/json", ".json")
 
-PORT = int(os.environ.get("PORT", 8080))
+PORT = int(os.environ.get("PORT", 3000))
 HOST = os.environ.get("HOST", "0.0.0.0")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 
 # Locate portal static files directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -198,14 +198,14 @@ Please provide:
             return answer, sources
     except Exception as e:
         print(f"[Gemini API Error] {e}")
-        # If gemini-2.0-flash failed with google_search tool (e.g. region or schema variation), retry without tool or standard
+        # If grounded request failed with google_search tool (e.g. region or schema variation), retry without tool
         try:
             payload_fallback = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.3, "maxOutputTokens": 1000}
             }
             req_fallback = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key={api_key}",
                 data=json.dumps(payload_fallback).encode("utf-8"),
                 headers=headers,
                 method="POST"

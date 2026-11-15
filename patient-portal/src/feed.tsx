@@ -1,57 +1,69 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { saveEncryptedVault } from './auth-context';
+import { FEED_CATEGORIES, inferCategoryFromEntry } from './feed-categories';
 import { cleanLabUnit, matchExtractedResultsToTwin } from './lab-matching';
 import { usePortalNavigation } from './navigation-context';
+import type { VoicePersonaData } from './preserve-math';
+import { MEMORY_ITEMS_STORE_KEY, MEMORIES_STORE_KEY } from './preserve';
 import type {
   BriefingResultPayload,
   ExtractApiResponse,
+  FeedCategory,
   FeedEntry,
+  FeedInterpretResponse,
   FeedKind,
+  FeedProvenance,
+  IdentityMemoryItem,
   MatchedLabRow,
+  ParsedFeedItem,
   PortalHostBridge,
   StoredBriefing,
+  VoiceConsentData,
 } from './types';
+import {
+  analyzeBlobAcoustics,
+  blobToBase64,
+  resolvePortalApiUrl,
+  SHARED_VOICE_CONSENT_KEY,
+  SHARED_VOICE_STORE_KEY,
+  trainAndTranscribeUserVoice,
+  VOICE_UPDATED_EVENT,
+} from './voice-engine';
 
 const FEED_STORAGE_KEY = 'mx-feed';
 export const BRIEFING_STORAGE_KEY = 'mx-briefing';
 export const BRIEFING_EVENT = 'mx-briefing-updated';
 export const FEED_EVENT = 'mx-feed-updated';
+export { FEED_CATEGORIES, inferCategoryFromEntry };
 
-const VITE_ASK_URL: string =
-  (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_ASK_URL) || '';
-
-function resolveApiUrl(path: string, hostApiBase?: string): string {
-  const base = (VITE_ASK_URL || hostApiBase || '').replace(/\/$/, '');
-  return `${base}${path}`;
-}
-
-const FEED_KINDS: Array<[FeedKind, string, string, string]> = [
-  ['lab', 'A lab result', 'A blood or urine value from a report', 'blood'],
-  ['measure', 'A measurement', 'Blood pressure, weight, heart rate, glucose', 'heart'],
-  ['medicine', 'A medicine or supplement', 'Something you take, with its dose', 'lifestyle'],
-  ['symptom', 'A symptom', 'Something new or changing', 'checkin'],
-  ['family', 'Family history', 'A condition in a relative', 'dna'],
-  ['lifestyle', 'Your habits', 'Sleep, activity, smoking, alcohol', 'lifestyle'],
-  ['report', 'A report or scan', 'Upload a PDF or photo for your care team', 'share'],
-];
+const PROVENANCE_LABELS: Record<FeedProvenance, string> = {
+  user_reported: 'User reported',
+  imported_record: 'Imported record',
+  measured_device: 'Measured value',
+  voice_spoken: 'Spoken voice',
+  ai_extracted: 'AI structured',
+};
 
 const MEASURE_UNITS: Array<[string, string]> = [
   ['Blood pressure', 'mmHg'],
   ['Weight', 'kg'],
+  ['Height', 'cm'],
   ['Heart rate', 'bpm'],
   ['Blood glucose', 'mg/dL'],
+  ['Sleep duration', 'hours'],
+  ['Body fat', '%'],
   ['Waist', 'cm'],
   ['Oxygen saturation', '%'],
 ];
 
 const RELATIVES = [
+  'Self / Personal context',
   'Mother',
   'Father',
   'Sister',
   'Brother',
   'Grandmother',
   'Grandfather',
-  'Aunt',
-  'Uncle',
   'Child',
 ];
 
@@ -139,7 +151,7 @@ export function ReportScanForm({
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 45000);
-      const response = await fetch(resolveApiUrl('/v1/extract', apiBase), {
+      const response = await fetch(resolvePortalApiUrl('/v1/extract', apiBase), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -212,9 +224,13 @@ export function ReportScanForm({
       const cleanUnit = row.unit ? row.unit.trim() : '';
       return {
         kind: 'lab',
+        category: 'test_results',
+        provenance: 'imported_record',
+        confidence: 0.96,
+        reviewStatus: 'pending_review',
         date: effectiveDate,
         title: `${row.name.trim()} ${row.value}${cleanUnit ? ` ${cleanUnit}` : ''}`.trim(),
-        detail: `from report, ${effectiveDate}`,
+        detail: `${labName ? `${labName} · ` : ''}from report (${effectiveDate})`,
         extracted: {
           name: row.name.trim(),
           value: row.value,
@@ -251,7 +267,7 @@ export function ReportScanForm({
 
   return (
     <form className="feed-form" onSubmit={handleSubmit}>
-      <FieldLabel label="File (PDF or photo)">
+      <FieldLabel label="Upload report (PDF, photo, genomic or imaging sheet)">
         <input
           ref={fileInputRef}
           type="file"
@@ -263,7 +279,7 @@ export function ReportScanForm({
       <div className="mx-sample-bar">
         <button
           type="button"
-          className="secondary mx-sample-btn"
+          className="secondary sm mx-sample-btn"
           disabled={extractState === 'reading' || loadingSample}
           onClick={handleLoadSampleReport}
         >
@@ -287,30 +303,18 @@ export function ReportScanForm({
 
       {extractState === 'reading' && (
         <div className="card mx-extract-status" role="status" aria-live="polite">
-          <div className="mx-status-line">
-            <span className="ap-dots" aria-hidden="true">
-              <i />
-              <i />
-              <i />
-            </span>
-            <b>Reading the report…</b>
-          </div>
+          <b>Reading the report…</b>
           <p className="note">
-            Checking printed test names, values, reference ranges, and comparing them against your twin.
+            Extracting test names, values, reference ranges, and comparing them longitudinally against your Twin without overwriting prior history.
           </p>
         </div>
       )}
 
       {extractState === 'empty' && (
         <div className="card mx-extract-status" role="status">
-          <div className="sec">
-            <span className="state warn">
-              <i />
-              Nothing found
-            </span>
-          </div>
+          <b>No structured lab values found</b>
           <p className="note">
-            We couldn’t find any printed lab results on that file. Try uploading a clearer photo or PDF lab report.
+            Try a clearer report photo/PDF, or switch to manual single-test entry above.
           </p>
         </div>
       )}
@@ -318,10 +322,7 @@ export function ReportScanForm({
       {extractState === 'unreachable' && (
         <div className="card mx-extract-status" role="alert">
           <div className="sec">
-            <span className="state warn">
-              <i />
-              Server not reachable
-            </span>
+            <b>Report reader unreachable</b>
             {selectedFile && (
               <button
                 type="button"
@@ -332,9 +333,7 @@ export function ReportScanForm({
               </button>
             )}
           </div>
-          <p className="note">
-            The report reader could not be reached right now. Please check that the server is running and try again.
-          </p>
+          <p className="note">Please verify localhost:3000 is running and retry.</p>
         </div>
       )}
 
@@ -350,7 +349,7 @@ export function ReportScanForm({
             </div>
             <span className="state warn">
               <i />
-              Waiting for check
+              Pending care-team check
             </span>
           </div>
 
@@ -359,8 +358,7 @@ export function ReportScanForm({
               {rows.map((row) => {
                 const displayUnit = cleanLabUnit(row.unit);
                 const prevDisplayUnit = cleanLabUnit(row.prevUnit || row.unit);
-                const flagTone =
-                  row.flag === 'high' || row.flag === 'low' ? 'warn' : 'ok';
+                const flagTone = row.flag === 'high' || row.flag === 'low' ? 'warn' : 'ok';
                 const pctFormatted =
                   row.pctChange != null
                     ? `${row.arrow || ''} ${row.pctChange > 0 ? '+' : ''}${row.pctChange.toFixed(1)}%`.trim()
@@ -392,7 +390,7 @@ export function ReportScanForm({
                         <small className="mx-review-twin">
                           {row.prevValue != null ? (
                             <>
-                              Twin latest ({row.matchedLabKey || row.name}):{' '}
+                              Twin prior ({row.matchedLabKey || row.name}):{' '}
                               <strong>
                                 {row.prevValue} {prevDisplayUnit}
                               </strong>
@@ -407,7 +405,7 @@ export function ReportScanForm({
                               )}
                             </>
                           ) : (
-                            <span>No prior value in twin</span>
+                            <span>New analyte for your Twin</span>
                           )}
                         </small>
                       </span>
@@ -429,119 +427,378 @@ export function ReportScanForm({
         type="submit"
         disabled={extractState !== 'ready' || keptRows.length === 0}
       >
-        Add to my twin
+        Add selected results to my twin
       </button>
-
-      <p className="note">
-        Your care team checks it first. Nothing you add changes your results, medicines or advice until then.
-      </p>
     </form>
   );
 }
 
-interface StandardFeedFormProps {
-  kind: Exclude<FeedKind, 'report'>;
+function CategoryEntryForm({
+  category,
+  bundle,
+  host,
+  onSave,
+  onAddReportRows,
+}: {
+  category: FeedCategory;
   bundle: any;
-  onSave: (entry: Omit<FeedEntry, 'id' | 'at'>) => void;
-}
-
-function StandardFeedForm({ kind, bundle, onSave }: StandardFeedFormProps) {
+  host: PortalHostBridge;
+  onSave: (entry: Omit<FeedEntry, 'id' | 'at'>, alsoSaveToMemories?: string) => void;
+  onAddReportRows: ReportScanFormProps['onAddKeptRows'];
+}) {
+  const [testSubMode, setTestSubMode] = useState<'scan' | 'manual'>('scan');
   const [form, setForm] = useState<Record<string, string>>({
     date: todayIso(),
     measure: 'Blood pressure',
-    relative: 'Mother',
-    medKind: 'Medicine',
+    medKind: 'Current prescription',
+    adherence: 'Taking as prescribed',
     severity: '3',
-    smoking: 'Never',
+    duration: 'Since yesterday',
+    mood: 'Calm & steady',
+    infoSubType: 'Family history',
+    relative: 'Mother',
+    trainVoiceToo: 'yes',
   });
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const recRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
 
   const setField =
     (field: string) =>
-    (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    (
+      e: React.ChangeEvent<
+        HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+      >
+    ) => {
       const value = e.target.value;
       setForm((prev) => ({ ...prev, [field]: value }));
     };
 
   const labSuggestions = useMemo(() => Object.keys(bundle?.labs ?? {}), [bundle]);
-  const measureUnit =
-    MEASURE_UNITS.find(([m]) => m === form.measure)?.[1] ?? '';
+  const measureUnit = MEASURE_UNITS.find(([m]) => m === form.measure)?.[1] ?? '';
   const isNumeric = (v?: string) =>
     v != null && v.trim() !== '' && !Number.isNaN(Number(v));
 
-  const dateInput = (
-    <FieldLabel label="Date">
-      <input
-        type="date"
-        max={todayIso()}
-        value={form.date ?? ''}
-        onChange={setField('date')}
-      />
-    </FieldLabel>
-  );
+  if (category === 'test_results') {
+    return (
+      <div className="mx-cat-sheet-body">
+        <div className="mx-tour-tabs">
+          <button
+            type="button"
+            className={`mx-kg-chip${testSubMode === 'scan' ? ' is-active' : ''}`}
+            onClick={() => setTestSubMode('scan')}
+          >
+            Upload PDF / Photo Report
+          </button>
+          <button
+            type="button"
+            className={`mx-kg-chip${testSubMode === 'manual' ? ' is-active' : ''}`}
+            onClick={() => setTestSubMode('manual')}
+          >
+            Enter Single Result
+          </button>
+        </div>
+
+        {testSubMode === 'scan' ? (
+          <ReportScanForm
+            bundle={bundle}
+            defaultDate={todayIso()}
+            apiBase={host.apiBase}
+            onAddKeptRows={onAddReportRows}
+          />
+        ) : (
+          <form
+            className="feed-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!form.test?.trim() || !isNumeric(form.value)) return;
+              onSave({
+                kind: 'lab',
+                category: 'test_results',
+                provenance: 'user_reported',
+                confidence: 0.95,
+                reviewStatus: 'pending_review',
+                date: form.date || todayIso(),
+                title: `${form.test.trim()} ${form.value} ${form.unit ?? ''}`.trim(),
+                detail: [form.testType || 'Lab test', form.lab?.trim()]
+                  .filter(Boolean)
+                  .join(' · '),
+              });
+            }}
+          >
+            <FieldLabel label="Investigation type">
+              <select value={form.testType ?? 'Blood / Urine Lab'} onChange={setField('testType')}>
+                <option>Blood / Urine Lab</option>
+                <option>Genomic / Pharmacogenomic Test</option>
+                <option>Imaging / Ultrasound / MRI</option>
+                <option>Diagnostic / Specialist Test</option>
+              </select>
+            </FieldLabel>
+            <FieldLabel label="Test or biomarker name">
+              <input
+                list="feed-labs"
+                value={form.test ?? ''}
+                onChange={setField('test')}
+                placeholder="e.g. HbA1c, eGFR, ApoB, Vitamin D"
+              />
+              <datalist id="feed-labs">
+                {labSuggestions.map((k) => (
+                  <option key={k} value={k} />
+                ))}
+              </datalist>
+            </FieldLabel>
+            <div className="feed-row">
+              <FieldLabel label="Value">
+                <input
+                  inputMode="decimal"
+                  value={form.value ?? ''}
+                  onChange={setField('value')}
+                />
+              </FieldLabel>
+              <FieldLabel label="Unit">
+                <input
+                  value={form.unit ?? ''}
+                  onChange={setField('unit')}
+                  placeholder="e.g. %, mg/dL"
+                />
+              </FieldLabel>
+            </div>
+            <FieldLabel label="Date">
+              <input
+                type="date"
+                max={todayIso()}
+                value={form.date ?? todayIso()}
+                onChange={setField('date')}
+              />
+            </FieldLabel>
+            <FieldLabel label="Laboratory or clinic (optional)">
+              <input value={form.lab ?? ''} onChange={setField('lab')} />
+            </FieldLabel>
+            <button
+              className="primary"
+              type="submit"
+              disabled={!form.test?.trim() || !isNumeric(form.value)}
+            >
+              Add test result to my twin
+            </button>
+          </form>
+        )}
+      </div>
+    );
+  }
+
+  if (category === 'voice_conversations') {
+    const handleVoiceCapture = async () => {
+      if (voiceRecording && recRef.current) {
+        recRef.current.stop();
+        setVoiceRecording(false);
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) return;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        chunksRef.current = [];
+        const rec = new MediaRecorder(stream);
+        recRef.current = rec;
+        rec.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
+        };
+        rec.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop());
+          setVoiceBusy(true);
+          try {
+            const mime = rec.mimeType || 'audio/webm';
+            const blob = new Blob(chunksRef.current, { type: mime });
+            const [b64, acoustics] = await Promise.all([
+              blobToBase64(blob),
+              analyzeBlobAcoustics(blob),
+            ]);
+            const consent = host.readStore<VoiceConsentData | null>(
+              SHARED_VOICE_CONSENT_KEY,
+              null
+            );
+            const allowTrain =
+              form.trainVoiceToo === 'yes' && (consent?.consented ?? true);
+            const existingVoice = host.readStore<VoicePersonaData | null>(
+              SHARED_VOICE_STORE_KEY,
+              null
+            );
+            const trained = await trainAndTranscribeUserVoice({
+              audioBase64: b64,
+              mimeType: mime,
+              sourceType: allowTrain ? 'conversation_audio' : 'text_only',
+              consentVerified: allowTrain,
+              measuredPitchHz: acoustics.pitchHz,
+              measuredBrightness: acoustics.brightness,
+              transcriptHint: form.voiceTopic || 'Spoken personal update for my twin.',
+              patientName: bundle?.patient?.preferred_name || 'Member',
+              existingProfile: existingVoice,
+              apiBase: host.apiBase,
+            });
+            if (allowTrain && trained.used_real_audio) {
+              host.writeStore(SHARED_VOICE_STORE_KEY, trained.profile);
+              window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+            }
+            setForm((prev) => ({ ...prev, voiceNoteText: trained.transcript || '' }));
+          } finally {
+            setVoiceBusy(false);
+          }
+        };
+        rec.start();
+        setVoiceRecording(true);
+      } catch {
+        // ignore
+      }
+    };
+
+    return (
+      <form
+        className="feed-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          const text = (form.voiceNoteText || '').trim();
+          if (!text) return;
+          onSave(
+            {
+              kind: 'voice_note',
+              category: 'voice_conversations',
+              provenance: 'voice_spoken',
+              confidence: 0.94,
+              reviewStatus: 'personal_context',
+              date: form.date || todayIso(),
+              title: form.voiceTopic?.trim() || 'Spoken personal update',
+              detail: text,
+            },
+            text
+          );
+        }}
+      >
+        <FieldLabel label="Topic or title">
+          <input
+            value={form.voiceTopic ?? ''}
+            onChange={setField('voiceTopic')}
+            placeholder="e.g. Weekly energy check-in, story from today"
+          />
+        </FieldLabel>
+
+        <div className="mx-voice-btn-row">
+          <button
+            type="button"
+            className={voiceRecording ? 'primary sm' : 'secondary sm'}
+            disabled={voiceBusy}
+            onClick={() => void handleVoiceCapture()}
+          >
+            {voiceRecording ? 'Stop recording' : voiceBusy ? 'Transcribing…' : 'Record spoken update'}
+          </button>
+
+          <label className="secondary sm mx-file-btn">
+            <span>Upload voice file</span>
+            <input
+              type="file"
+              accept="audio/*"
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                setVoiceBusy(true);
+                try {
+                  const [b64, acoustics] = await Promise.all([
+                    blobToBase64(f),
+                    analyzeBlobAcoustics(f),
+                  ]);
+                  const existingVoice = host.readStore<VoicePersonaData | null>(
+                    SHARED_VOICE_STORE_KEY,
+                    null
+                  );
+                  const allowTrain = form.trainVoiceToo === 'yes';
+                  const trained = await trainAndTranscribeUserVoice({
+                    audioBase64: b64,
+                    mimeType: f.type || 'audio/wav',
+                    sourceType: allowTrain ? 'uploaded_audio' : 'text_only',
+                    consentVerified: allowTrain,
+                    measuredPitchHz: acoustics.pitchHz,
+                    measuredBrightness: acoustics.brightness,
+                    transcriptHint: form.voiceTopic || f.name,
+                    patientName: bundle?.patient?.preferred_name || 'Member',
+                    existingProfile: existingVoice,
+                    apiBase: host.apiBase,
+                  });
+                  if (allowTrain && trained.used_real_audio) {
+                    host.writeStore(SHARED_VOICE_STORE_KEY, trained.profile);
+                    window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+                  }
+                  setForm((prev) => ({
+                    ...prev,
+                    voiceTopic: prev.voiceTopic || f.name,
+                    voiceNoteText: trained.transcript || '',
+                  }));
+                } finally {
+                  setVoiceBusy(false);
+                }
+              }}
+            />
+          </label>
+        </div>
+
+        <label className="mx-voice-toggle">
+          <input
+            type="checkbox"
+            checked={form.trainVoiceToo === 'yes'}
+            onChange={(e) =>
+              setForm((prev) => ({
+                ...prev,
+                trainVoiceToo: e.target.checked ? 'yes' : 'no',
+              }))
+            }
+          />
+          <span>Use real audio from this recording to refine my Twin’s voice profile</span>
+        </label>
+
+        <FieldLabel label="Spoken transcript / conversation summary">
+          <textarea
+            rows={3}
+            value={form.voiceNoteText ?? ''}
+            onChange={setField('voiceNoteText')}
+            placeholder="Record audio above or summarize a conversation you want your Twin to remember…"
+          />
+        </FieldLabel>
+
+        <button
+          className="primary"
+          type="submit"
+          disabled={!(form.voiceNoteText || '').trim()}
+        >
+          Save to my twin
+        </button>
+      </form>
+    );
+  }
 
   let valid = Boolean(form.date);
   let fields: React.ReactNode = null;
-  let buildEntry = (): Omit<FeedEntry, 'id' | 'at'> => ({
-    kind,
-    date: form.date,
-    title: '',
-    detail: '',
+  let buildPayload = (): {
+    entry: Omit<FeedEntry, 'id' | 'at'>;
+    memorySync?: string;
+  } => ({
+    entry: {
+      kind: 'personal_info',
+      category,
+      provenance: 'user_reported',
+      confidence: 0.95,
+      reviewStatus: 'pending_review',
+      date: form.date || todayIso(),
+      title: '',
+      detail: '',
+    },
   });
 
-  switch (kind) {
-    case 'lab': {
-      valid = valid && Boolean(form.test?.trim()) && isNumeric(form.value);
-      fields = (
-        <>
-          <FieldLabel label="Test">
-            <input
-              list="feed-labs"
-              value={form.test ?? ''}
-              onChange={setField('test')}
-              placeholder="e.g. HbA1c"
-            />
-            <datalist id="feed-labs">
-              {labSuggestions.map((k) => (
-                <option key={k} value={k} />
-              ))}
-            </datalist>
-          </FieldLabel>
-          <div className="feed-row">
-            <FieldLabel label="Value">
-              <input
-                inputMode="decimal"
-                value={form.value ?? ''}
-                onChange={setField('value')}
-              />
-            </FieldLabel>
-            <FieldLabel label="Unit">
-              <input
-                value={form.unit ?? ''}
-                onChange={setField('unit')}
-                placeholder="e.g. %"
-              />
-            </FieldLabel>
-          </div>
-          {dateInput}
-          <FieldLabel label="Laboratory (optional)">
-            <input value={form.lab ?? ''} onChange={setField('lab')} />
-          </FieldLabel>
-        </>
-      );
-      buildEntry = () => ({
-        kind,
-        date: form.date,
-        title: `${form.test.trim()} ${form.value} ${form.unit ?? ''}`.trim(),
-        detail: form.lab?.trim() ?? '',
-      });
-      break;
-    }
-    case 'measure': {
+  switch (category) {
+    case 'measurements': {
       const isBp = form.measure === 'Blood pressure';
       valid = valid && (isBp ? isNumeric(form.sys) && isNumeric(form.dia) : isNumeric(form.value));
       fields = (
         <>
-          <FieldLabel label="What">
+          <FieldLabel label="Measurement">
             <select value={form.measure} onChange={setField('measure')}>
               {MEASURE_UNITS.map(([m]) => (
                 <option key={m}>{m}</option>
@@ -550,108 +807,123 @@ function StandardFeedForm({ kind, bundle, onSave }: StandardFeedFormProps) {
           </FieldLabel>
           {isBp ? (
             <div className="feed-row">
-              <FieldLabel label="Systolic">
-                <input
-                  inputMode="numeric"
-                  value={form.sys ?? ''}
-                  onChange={setField('sys')}
-                />
+              <FieldLabel label="Systolic (mmHg)">
+                <input inputMode="numeric" value={form.sys ?? ''} onChange={setField('sys')} />
               </FieldLabel>
-              <FieldLabel label="Diastolic">
-                <input
-                  inputMode="numeric"
-                  value={form.dia ?? ''}
-                  onChange={setField('dia')}
-                />
+              <FieldLabel label="Diastolic (mmHg)">
+                <input inputMode="numeric" value={form.dia ?? ''} onChange={setField('dia')} />
               </FieldLabel>
             </div>
           ) : (
             <FieldLabel label={`Value (${measureUnit})`}>
-              <input
-                inputMode="decimal"
-                value={form.value ?? ''}
-                onChange={setField('value')}
-              />
+              <input inputMode="decimal" value={form.value ?? ''} onChange={setField('value')} />
             </FieldLabel>
           )}
-          {dateInput}
+          <div className="feed-row">
+            <FieldLabel label="Source">
+              <select value={form.source ?? 'Home monitor'} onChange={setField('source')}>
+                <option>Home monitor</option>
+                <option>Wearable / smartwatch</option>
+                <option>Clinic visit</option>
+              </select>
+            </FieldLabel>
+            <FieldLabel label="Date">
+              <input type="date" max={todayIso()} value={form.date} onChange={setField('date')} />
+            </FieldLabel>
+          </div>
         </>
       );
-      buildEntry = () => ({
-        kind,
-        date: form.date,
-        title: `${form.measure} ${isBp ? `${form.sys}/${form.dia}` : form.value} ${measureUnit}`,
-        detail: 'measured at home',
+      buildPayload = () => ({
+        entry: {
+          kind: 'measure',
+          category: 'measurements',
+          provenance:
+            form.source === 'Wearable / smartwatch' || form.source === 'Home monitor'
+              ? 'measured_device'
+              : 'user_reported',
+          confidence: 0.96,
+          reviewStatus: 'pending_review',
+          date: form.date,
+          title: `${form.measure} ${isBp ? `${form.sys}/${form.dia}` : form.value} ${measureUnit}`,
+          detail: form.source || 'Home measurement',
+        },
       });
       break;
     }
-    case 'medicine': {
+
+    case 'medicines': {
       valid = valid && Boolean(form.name?.trim());
       fields = (
         <>
-          <FieldLabel label="Medicine or supplement">
-            <select value={form.medKind} onChange={setField('medKind')}>
-              <option>Medicine</option>
-              <option>Supplement</option>
-            </select>
-          </FieldLabel>
-          <FieldLabel label="Name">
-            <input value={form.name ?? ''} onChange={setField('name')} />
+          <div className="feed-row">
+            <FieldLabel label="Category">
+              <select value={form.medKind} onChange={setField('medKind')}>
+                <option>Current prescription</option>
+                <option>Supplement / vitamin</option>
+                <option>Dose change</option>
+                <option>Historical / stopped medicine</option>
+              </select>
+            </FieldLabel>
+            <FieldLabel label="Adherence">
+              <select value={form.adherence} onChange={setField('adherence')}>
+                <option>Taking as prescribed</option>
+                <option>Just started</option>
+                <option>Occasionally missed</option>
+                <option>Paused / discontinued</option>
+              </select>
+            </FieldLabel>
+          </div>
+          <FieldLabel label="Medicine or supplement name">
+            <input
+              value={form.name ?? ''}
+              onChange={setField('name')}
+              placeholder="e.g. Losartan, Magnesium glycinate"
+            />
           </FieldLabel>
           <div className="feed-row">
-            <FieldLabel label="Dose">
-              <input
-                value={form.dose ?? ''}
-                onChange={setField('dose')}
-                placeholder="e.g. 50 mg"
-              />
+            <FieldLabel label="Dosage">
+              <input value={form.dose ?? ''} onChange={setField('dose')} placeholder="e.g. 50 mg" />
             </FieldLabel>
-            <FieldLabel label="How often">
+            <FieldLabel label="Frequency">
               <input
                 value={form.freq ?? ''}
                 onChange={setField('freq')}
-                placeholder="e.g. once a day"
+                placeholder="e.g. once daily in morning"
               />
             </FieldLabel>
           </div>
-          <FieldLabel label="Started on">
-            <input
-              type="date"
-              max={todayIso()}
-              value={form.date ?? ''}
-              onChange={setField('date')}
-            />
+          <FieldLabel label="Effective date">
+            <input type="date" max={todayIso()} value={form.date} onChange={setField('date')} />
           </FieldLabel>
         </>
       );
-      buildEntry = () => ({
-        kind,
-        date: form.date,
-        title: [form.name.trim(), form.dose].filter(Boolean).join(' '),
-        detail: [form.medKind, form.freq].filter(Boolean).join(', '),
+      buildPayload = () => ({
+        entry: {
+          kind: 'medicine',
+          category: 'medicines',
+          provenance: 'user_reported',
+          confidence: 0.95,
+          reviewStatus: 'pending_review',
+          date: form.date,
+          title: [form.name.trim(), form.dose].filter(Boolean).join(' '),
+          detail: [form.medKind, form.freq, form.adherence].filter(Boolean).join(' · '),
+        },
       });
       break;
     }
-    case 'symptom': {
+
+    case 'symptoms': {
       valid = valid && Boolean(form.what?.trim());
       fields = (
         <>
-          <FieldLabel label="What you notice">
+          <FieldLabel label="Symptom">
             <input
               value={form.what ?? ''}
               onChange={setField('what')}
-              placeholder="e.g. swollen ankles"
+              placeholder="e.g. Temporal headache, ankle swelling, afternoon fatigue"
             />
           </FieldLabel>
-          <FieldLabel label="Since">
-            <input
-              type="date"
-              max={todayIso()}
-              value={form.date ?? ''}
-              onChange={setField('date')}
-            />
-          </FieldLabel>
-          <FieldLabel label={`How much it bothers you: ${form.severity} of 5`}>
+          <FieldLabel label={`Severity: ${form.severity} of 5`}>
             <input
               type="range"
               min="1"
@@ -660,106 +932,221 @@ function StandardFeedForm({ kind, bundle, onSave }: StandardFeedFormProps) {
               onChange={setField('severity')}
             />
           </FieldLabel>
-        </>
-      );
-      buildEntry = () => ({
-        kind,
-        date: form.date,
-        title: form.what.trim(),
-        detail: `bothers you ${form.severity} of 5`,
-      });
-      break;
-    }
-    case 'family': {
-      valid = valid && Boolean(form.condition?.trim());
-      fields = (
-        <>
-          <FieldLabel label="Relative">
-            <select value={form.relative} onChange={setField('relative')}>
-              {RELATIVES.map((rel) => (
-                <option key={rel}>{rel}</option>
-              ))}
-            </select>
-          </FieldLabel>
-          <FieldLabel label="Condition">
-            <input
-              value={form.condition ?? ''}
-              onChange={setField('condition')}
-              placeholder="e.g. kidney disease"
-            />
-          </FieldLabel>
-          <FieldLabel label="Age when diagnosed (optional)">
-            <input
-              inputMode="numeric"
-              value={form.age ?? ''}
-              onChange={setField('age')}
-            />
+          <div className="feed-row">
+            <FieldLabel label="Duration / frequency">
+              <input
+                value={form.duration ?? ''}
+                onChange={setField('duration')}
+                placeholder="e.g. 3 hours, intermittent"
+              />
+            </FieldLabel>
+            <FieldLabel label="Suspected trigger (optional)">
+              <input
+                value={form.triggers ?? ''}
+                onChange={setField('triggers')}
+                placeholder="e.g. poor sleep, dehydration"
+              />
+            </FieldLabel>
+          </div>
+          <FieldLabel label="Date">
+            <input type="date" max={todayIso()} value={form.date} onChange={setField('date')} />
           </FieldLabel>
         </>
       );
-      buildEntry = () => ({
-        kind,
-        date: todayIso(),
-        title: `${form.relative}: ${form.condition.trim()}`,
-        detail: form.age ? `diagnosed at ${form.age}` : '',
+      buildPayload = () => ({
+        entry: {
+          kind: 'symptom',
+          category: 'symptoms',
+          provenance: 'user_reported',
+          confidence: 0.95,
+          reviewStatus: 'pending_review',
+          date: form.date,
+          title: `${form.what.trim()} (severity ${form.severity}/5)`,
+          detail: [
+            form.duration,
+            form.triggers ? `trigger: ${form.triggers}` : '',
+          ]
+            .filter(Boolean)
+            .join(' · '),
+        },
       });
       break;
     }
-    case 'lifestyle': {
+
+    case 'daily_activities': {
       valid =
         valid &&
-        (isNumeric(form.sleep) ||
-          isNumeric(form.activity) ||
-          isNumeric(form.alcohol) ||
-          Boolean(form.smoking));
+        Boolean(
+          form.exercise?.trim() ||
+            form.sleep?.trim() ||
+            form.nutrition?.trim() ||
+            form.hydration?.trim()
+        );
       fields = (
         <>
           <div className="feed-row">
-            <FieldLabel label="Sleep (hours a night)">
+            <FieldLabel label="Sleep last night (hours)">
               <input
                 inputMode="decimal"
                 value={form.sleep ?? ''}
                 onChange={setField('sleep')}
+                placeholder="e.g. 7.5"
               />
             </FieldLabel>
-            <FieldLabel label="Activity (minutes a week)">
+            <FieldLabel label="Hydration (liters / glasses)">
               <input
-                inputMode="numeric"
-                value={form.activity ?? ''}
-                onChange={setField('activity')}
+                value={form.hydration ?? ''}
+                onChange={setField('hydration')}
+                placeholder="e.g. 2.2 L water"
               />
             </FieldLabel>
           </div>
-          <div className="feed-row">
-            <FieldLabel label="Smoking">
-              <select value={form.smoking} onChange={setField('smoking')}>
-                <option>Never</option>
-                <option>Former</option>
-                <option>Current</option>
-              </select>
-            </FieldLabel>
-            <FieldLabel label="Alcohol (drinks a week)">
-              <input
-                inputMode="numeric"
-                value={form.alcohol ?? ''}
-                onChange={setField('alcohol')}
-              />
-            </FieldLabel>
-          </div>
+          <FieldLabel label="Exercise & physical activity">
+            <input
+              value={form.exercise ?? ''}
+              onChange={setField('exercise')}
+              placeholder="e.g. 35 min brisk walk + mobility"
+            />
+          </FieldLabel>
+          <FieldLabel label="Nutrition & routine notes">
+            <input
+              value={form.nutrition ?? ''}
+              onChange={setField('nutrition')}
+              placeholder="e.g. Low-sodium home-cooked dinner, early bedtime"
+            />
+          </FieldLabel>
+          <FieldLabel label="Date">
+            <input type="date" max={todayIso()} value={form.date} onChange={setField('date')} />
+          </FieldLabel>
         </>
       );
-      buildEntry = () => ({
-        kind,
-        date: todayIso(),
-        title: 'Your habits',
-        detail: [
-          form.sleep && `${form.sleep} h sleep`,
-          form.activity && `${form.activity} min activity a week`,
-          `smoking: ${form.smoking.toLowerCase()}`,
-          form.alcohol && `${form.alcohol} drinks a week`,
-        ]
-          .filter(Boolean)
-          .join(', '),
+      buildPayload = () => ({
+        entry: {
+          kind: 'lifestyle',
+          category: 'daily_activities',
+          provenance: 'user_reported',
+          confidence: 0.95,
+          reviewStatus: 'personal_context',
+          date: form.date,
+          title: form.exercise?.trim()
+            ? `Activity: ${form.exercise.trim()}`
+            : form.sleep?.trim()
+              ? `Sleep: ${form.sleep.trim()} hours`
+              : 'Daily lifestyle update',
+          detail: [
+            form.sleep && `${form.sleep}h sleep`,
+            form.hydration && `hydration: ${form.hydration}`,
+            form.nutrition,
+          ]
+            .filter(Boolean)
+            .join(' · '),
+        },
+      });
+      break;
+    }
+
+    case 'personal_diary': {
+      valid = valid && Boolean(form.diaryText?.trim());
+      fields = (
+        <>
+          <div className="feed-row">
+            <FieldLabel label="Headline or moment">
+              <input
+                value={form.diaryTitle ?? ''}
+                onChange={setField('diaryTitle')}
+                placeholder="e.g. Quiet Sunday reflection"
+              />
+            </FieldLabel>
+            <FieldLabel label="How I felt">
+              <select value={form.mood} onChange={setField('mood')}>
+                <option>Calm &amp; steady</option>
+                <option>Energized &amp; grateful</option>
+                <option>Reflective</option>
+                <option>Stretched / tired</option>
+                <option>Stressed / anxious</option>
+              </select>
+            </FieldLabel>
+          </div>
+          <FieldLabel label="Personal reflection, experience, or note for your Twin">
+            <textarea
+              rows={4}
+              value={form.diaryText ?? ''}
+              onChange={setField('diaryText')}
+              placeholder="Write about your day, feelings, meaningful events, or something you want your Digital Twin to always remember…"
+            />
+          </FieldLabel>
+          <FieldLabel label="Date">
+            <input type="date" max={todayIso()} value={form.date} onChange={setField('date')} />
+          </FieldLabel>
+        </>
+      );
+      buildPayload = () => {
+        const title = form.diaryTitle?.trim() || `Diary · ${form.mood}`;
+        const body = form.diaryText.trim();
+        return {
+          entry: {
+            kind: 'diary',
+            category: 'personal_diary',
+            provenance: 'user_reported',
+            confidence: 0.98,
+            reviewStatus: 'personal_context',
+            date: form.date,
+            title,
+            detail: body,
+          },
+          memorySync: `${title}: ${body}`,
+        };
+      };
+      break;
+    }
+
+    case 'additional_personal_info': {
+      valid = valid && Boolean(form.infoDetail?.trim());
+      fields = (
+        <>
+          <div className="feed-row">
+            <FieldLabel label="Information type">
+              <select value={form.infoSubType} onChange={setField('infoSubType')}>
+                <option>Family history</option>
+                <option>Allergy or sensitivity</option>
+                <option>Past procedure or surgery</option>
+                <option>Connected health device</option>
+                <option>Work, travel or life environment</option>
+              </select>
+            </FieldLabel>
+            <FieldLabel label="Applies to">
+              <select value={form.relative} onChange={setField('relative')}>
+                {RELATIVES.map((rel) => (
+                  <option key={rel}>{rel}</option>
+                ))}
+              </select>
+            </FieldLabel>
+          </div>
+          <FieldLabel label="Details">
+            <textarea
+              rows={3}
+              value={form.infoDetail ?? ''}
+              onChange={setField('infoDetail')}
+              placeholder="e.g. Father diagnosed with hypertension at 52; or connected Apple Watch sleep & HRV sync…"
+            />
+          </FieldLabel>
+        </>
+      );
+      buildPayload = () => ({
+        entry: {
+          kind: form.infoSubType === 'Family history' ? 'family' : 'personal_info',
+          category: 'additional_personal_info',
+          provenance: 'user_reported',
+          confidence: 0.95,
+          reviewStatus: 'pending_review',
+          date: form.date || todayIso(),
+          title: `${form.infoSubType}${
+            form.relative && form.relative !== 'Self / Personal context'
+              ? ` (${form.relative})`
+              : ''
+          }`,
+          detail: form.infoDetail.trim(),
+        },
       });
       break;
     }
@@ -770,7 +1157,9 @@ function StandardFeedForm({ kind, bundle, onSave }: StandardFeedFormProps) {
       className="feed-form"
       onSubmit={(e) => {
         e.preventDefault();
-        if (valid) onSave(buildEntry());
+        if (!valid) return;
+        const built = buildPayload();
+        onSave(built.entry, built.memorySync);
       }}
     >
       {fields}
@@ -778,7 +1167,7 @@ function StandardFeedForm({ kind, bundle, onSave }: StandardFeedFormProps) {
         Add to my twin
       </button>
       <p className="note">
-        Your care team checks it first. Nothing you add changes your results, medicines or advice until then.
+        Historical records are preserved chronologically — adding new updates never overwrites prior entries.
       </p>
     </form>
   );
@@ -796,21 +1185,33 @@ export function FeedScreen({
   const [entries, setEntries] = useState<FeedEntry[]>(() =>
     host.readStore<FeedEntry[]>(FEED_STORAGE_KEY, [])
   );
-  const [activeKind, setActiveKind] = useState<FeedKind | null>(null);
+  const [activeCategory, setActiveCategory] = useState<FeedCategory | null>(null);
+  const [timelineFilter, setTimelineFilter] = useState<'all' | FeedCategory>('all');
   const [briefing, setBriefing] = useState<StoredBriefing | null>(() =>
     host.readStore<StoredBriefing | null>(BRIEFING_STORAGE_KEY, null)
   );
   const [briefingLoading, setBriefingLoading] = useState(false);
   const [briefingError, setBriefingError] = useState(false);
 
-  // Sync when patient switches
+  // Multimodal AI Quick-Capture bar state
+  const [freeformText, setFreeformText] = useState('');
+  const [interpreting, setInterpreting] = useState(false);
+  const [interpretError, setInterpretError] = useState<string | null>(null);
+  const [parsedSummary, setParsedSummary] = useState<string | null>(null);
+  const [parsedItems, setParsedItems] = useState<Array<ParsedFeedItem & { id: string; kept: boolean }>>([]);
+  const [isRecordingQuickVoice, setIsRecordingQuickVoice] = useState(false);
+  const quickVoiceRecRef = useRef<MediaRecorder | null>(null);
+  const quickVoiceChunksRef = useRef<Blob[]>([]);
+
   useEffect(() => {
     setEntries(host.readStore<FeedEntry[]>(FEED_STORAGE_KEY, []));
     setBriefing(host.readStore<StoredBriefing | null>(BRIEFING_STORAGE_KEY, null));
+    setParsedItems([]);
+    setParsedSummary(null);
   }, [patientId, host]);
 
-  const kindLabel = (k: FeedKind) =>
-    FEED_KINDS.find(([id]) => id === k)?.[1] ?? k;
+  const categoryTitle = (catId: FeedCategory) =>
+    FEED_CATEGORIES.find((c) => c.id === catId)?.title ?? catId;
 
   const persistEntries = (next: FeedEntry[]) => {
     setEntries(next);
@@ -818,7 +1219,29 @@ export function FeedScreen({
     window.dispatchEvent(new Event(FEED_EVENT));
   };
 
-  const handleSaveSingle = (entry: Omit<FeedEntry, 'id' | 'at'>) => {
+  const appendMemoryNoteIfPresent = (noteText?: string) => {
+    if (!noteText?.trim()) return;
+    const existingRich = host.readStore<IdentityMemoryItem[]>(MEMORY_ITEMS_STORE_KEY, []);
+    const item: IdentityMemoryItem = {
+      id: `mem-feed-${Date.now()}`,
+      at: new Date().toISOString(),
+      category: 'diary',
+      text: noteText.trim(),
+      source: 'diary_sync',
+    };
+    const nextRich = [item, ...existingRich];
+    host.writeStore(MEMORY_ITEMS_STORE_KEY, nextRich);
+    host.writeStore(
+      MEMORIES_STORE_KEY,
+      nextRich.map((m) => m.text)
+    );
+    void saveEncryptedVault(patientId, { memories: nextRich }, host.apiBase);
+  };
+
+  const handleSaveSingle = (
+    entry: Omit<FeedEntry, 'id' | 'at'>,
+    alsoSaveToMemories?: string
+  ) => {
     const now = new Date().toISOString();
     const created: FeedEntry = {
       ...entry,
@@ -826,7 +1249,157 @@ export function FeedScreen({
       at: now,
     };
     persistEntries([created, ...entries]);
-    setActiveKind(null);
+    appendMemoryNoteIfPresent(alsoSaveToMemories);
+    setActiveCategory(null);
+  };
+
+  const handleInterpretMultimodal = async (opts?: {
+    overrideText?: string;
+    audioBase64?: string;
+    audioMime?: string;
+    imageBase64?: string;
+    imageMime?: string;
+  }) => {
+    const textInput = (opts?.overrideText ?? freeformText).trim();
+    if (!textInput && !opts?.audioBase64 && !opts?.imageBase64) return;
+
+    setInterpreting(true);
+    setInterpretError(null);
+    try {
+      const res = await fetch(resolvePortalApiUrl('/v1/feed/interpret', host.apiBase), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: textInput || undefined,
+          audio_base64: opts?.audioBase64,
+          audio_mime_type: opts?.audioMime,
+          image_base64: opts?.imageBase64,
+          image_mime_type: opts?.imageMime,
+          today_iso: todayIso(),
+          bundle: b,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Interpretation returned HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as FeedInterpretResponse;
+      if (data.transcript && !freeformText.trim()) {
+        setFreeformText(data.transcript);
+      }
+      setParsedSummary(data.summary || 'Structured into Twin timeline items.');
+      setParsedItems(
+        (data.items || []).map((item, i) => ({
+          ...item,
+          id: `pi-${Date.now()}-${i}`,
+          kept: true,
+        }))
+      );
+    } catch (err: any) {
+      setInterpretError(err?.message || 'Could not interpret input right now.');
+    } finally {
+      setInterpreting(false);
+    }
+  };
+
+  const handleCommitParsedItems = () => {
+    const selected = parsedItems.filter((p) => p.kept);
+    if (selected.length === 0) return;
+
+    const nowIso = new Date().toISOString();
+    const baseTs = Date.now();
+    const newEntries: FeedEntry[] = selected.map((item, idx) => ({
+      id: `${baseTs}-${idx}`,
+      at: nowIso,
+      kind: item.kind,
+      category: item.category,
+      provenance: item.provenance,
+      confidence: item.confidence,
+      reviewStatus:
+        item.category === 'personal_diary' ||
+        item.category === 'daily_activities' ||
+        item.category === 'voice_conversations'
+          ? 'personal_context'
+          : 'pending_review',
+      date: item.effective_date || todayIso(),
+      title: item.title,
+      detail: item.detail,
+      structured: item.structured,
+    }));
+
+    persistEntries([...newEntries, ...entries]);
+
+    for (const item of selected) {
+      if (item.category === 'personal_diary') {
+        appendMemoryNoteIfPresent(`${item.title}: ${item.detail}`);
+      }
+    }
+
+    setParsedItems([]);
+    setParsedSummary(null);
+    setFreeformText('');
+  };
+
+  const handleToggleQuickVoice = async () => {
+    if (isRecordingQuickVoice && quickVoiceRecRef.current) {
+      quickVoiceRecRef.current.stop();
+      setIsRecordingQuickVoice(false);
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setInterpretError('Microphone unavailable in this browser — type or upload a file instead.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      quickVoiceChunksRef.current = [];
+      const rec = new MediaRecorder(stream);
+      quickVoiceRecRef.current = rec;
+      rec.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) quickVoiceChunksRef.current.push(ev.data);
+      };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const mime = rec.mimeType || 'audio/webm';
+        const blob = new Blob(quickVoiceChunksRef.current, { type: mime });
+        const [b64, acoustics] = await Promise.all([
+          blobToBase64(blob),
+          analyzeBlobAcoustics(blob),
+        ]);
+
+        // Also refine voice profile if user opted into conversational voice learning
+        const consent = host.readStore<VoiceConsentData | null>(SHARED_VOICE_CONSENT_KEY, null);
+        if (consent?.consented && consent.allowConversationalRefinement) {
+          const existingVoice = host.readStore<VoicePersonaData | null>(
+            SHARED_VOICE_STORE_KEY,
+            null
+          );
+          trainAndTranscribeUserVoice({
+            audioBase64: b64,
+            mimeType: mime,
+            sourceType: 'conversation_audio',
+            consentVerified: true,
+            measuredPitchHz: acoustics.pitchHz,
+            measuredBrightness: acoustics.brightness,
+            patientName: b?.patient?.preferred_name || 'Member',
+            existingProfile: existingVoice,
+            apiBase: host.apiBase,
+          })
+            .then((trained) => {
+              if (trained.used_real_audio) {
+                host.writeStore(SHARED_VOICE_STORE_KEY, trained.profile);
+                window.dispatchEvent(new Event(VOICE_UPDATED_EVENT));
+              }
+            })
+            .catch(() => {});
+        }
+
+        await handleInterpretMultimodal({ audioBase64: b64, audioMime: mime });
+      };
+      rec.start();
+      setIsRecordingQuickVoice(true);
+    } catch {
+      setInterpretError('Could not start microphone recording.');
+    }
   };
 
   const handleAddReportRows = async (
@@ -844,13 +1417,12 @@ export function FeedScreen({
 
     const updated = [...stamped, ...entries];
     persistEntries(updated);
-    setActiveKind(null);
+    setActiveCategory(null);
 
-    // Immediately generate patient + clinician briefing via POST /v1/briefing
     setBriefingLoading(true);
     setBriefingError(false);
     try {
-      const res = await fetch(resolveApiUrl('/v1/briefing', host.apiBase), {
+      const res = await fetch(resolvePortalApiUrl('/v1/briefing', host.apiBase), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -882,6 +1454,11 @@ export function FeedScreen({
     persistEntries(entries.filter((e) => e.id !== id));
   };
 
+  const filteredEntries = useMemo(() => {
+    if (timelineFilter === 'all') return entries;
+    return entries.filter((e) => inferCategoryFromEntry(e) === timelineFilter);
+  }, [entries, timelineFilter]);
+
   const Hero = host.Hero;
   const InfoBanner = host.InfoBanner;
   const Sheet = host.Sheet;
@@ -889,44 +1466,194 @@ export function FeedScreen({
   const AskQuestions = host.AskQuestions;
   const patientAsks = (b?.info_needed ?? []).filter((x: any) => x.from === 'you');
 
+  const exampleSentence =
+    'I had a headache yesterday, slept for only five hours, and started taking a new medicine.';
+
   return (
     <>
       {Hero && (
         <Hero
           title="Feed your twin"
           illus="twin"
-          sub="Add what your twin doesn't know yet. Your care team checks each entry before your twin uses it."
+          sub="Contribute test results, measurements, medicines, symptoms, daily activities, diary reflections, and spoken updates to your evolving Digital Twin."
         />
       )}
 
+      {/* MULTIMODAL AI QUICK-CAPTURE BAR */}
+      <section
+        className="card mx-multimodal-feed-card"
+        aria-label="Tell, Speak, or Upload Anything"
+      >
+        <div className="sec">
+          <div>
+            <span className="mx-eyebrow">AI Multimodal Interpreter · Provenance Tracked</span>
+            <h2>Tell, speak, or upload anything</h2>
+          </div>
+          <button
+            type="button"
+            className="link"
+            disabled={interpreting}
+            onClick={() => {
+              setFreeformText(exampleSentence);
+              void handleInterpretMultimodal({ overrideText: exampleSentence });
+            }}
+          >
+            Try multi-entity example →
+          </button>
+        </div>
+
+        <p className="note">
+          Type or speak naturally in one sentence — your Twin separates symptoms, sleep, activities, measurements, medicines, and diary notes into their exact timelines with confidence and source provenance.
+        </p>
+
+        <textarea
+          rows={3}
+          className="mx-quick-feed-textarea"
+          aria-label="Natural language update for your twin"
+          placeholder={`e.g. "${exampleSentence}"`}
+          value={freeformText}
+          onChange={(e) => setFreeformText(e.target.value)}
+        />
+
+        <div className="mx-voice-btn-row">
+          <button
+            type="button"
+            className="primary sm"
+            disabled={!freeformText.trim() || interpreting}
+            onClick={() => void handleInterpretMultimodal()}
+          >
+            {interpreting ? 'Interpreting…' : 'Interpret & structure'}
+          </button>
+
+          <button
+            type="button"
+            className={isRecordingQuickVoice ? 'primary sm' : 'secondary sm'}
+            disabled={interpreting}
+            onClick={() => void handleToggleQuickVoice()}
+          >
+            {isRecordingQuickVoice ? 'Stop & interpret speech' : 'Speak naturally'}
+          </button>
+
+          <label className="secondary sm mx-file-btn">
+            <span>Upload image / note</span>
+            <input
+              type="file"
+              accept="image/png,image/jpeg,application/pdf"
+              disabled={interpreting}
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                if (f.type === 'application/pdf') {
+                  setActiveCategory('test_results');
+                  return;
+                }
+                const b64 = await fileToBase64(f);
+                await handleInterpretMultimodal({
+                  imageBase64: b64,
+                  imageMime: inferMimeType(f),
+                });
+              }}
+            />
+          </label>
+        </div>
+
+        {interpretError && (
+          <p className="note mx-err-note" role="alert">
+            {interpretError}
+          </p>
+        )}
+
+        {parsedItems.length > 0 && (
+          <div className="mx-parsed-preview" data-testid="parsed-feed-preview">
+            <div className="sec">
+              <b>{parsedSummary}</b>
+              <span className="note mx-tabular">
+                {parsedItems.filter((i) => i.kept).length} of {parsedItems.length} selected
+              </span>
+            </div>
+
+            <ul className="rs-rows mx-review-rows">
+              {parsedItems.map((item) => (
+                <li
+                  key={item.id}
+                  className={`mx-review-row${item.kept ? '' : ' is-unticked'}`}
+                >
+                  <label className="mx-review-check">
+                    <input
+                      type="checkbox"
+                      checked={item.kept}
+                      onChange={() =>
+                        setParsedItems((prev) =>
+                          prev.map((x) =>
+                            x.id === item.id ? { ...x, kept: !x.kept } : x
+                          )
+                        )
+                      }
+                    />
+                    <span className="mx-review-main">
+                      <span className="mx-review-title-line">
+                        <b>{item.title}</b>
+                      </span>
+                      <small className="mx-review-sub">
+                        {categoryTitle(item.category)} ·{' '}
+                        {host.formatDate(item.effective_date) || item.effective_date || todayIso()} ·{' '}
+                        {PROVENANCE_LABELS[item.provenance] || item.provenance} ·{' '}
+                        <span className="mx-tabular">
+                          {Math.round(item.confidence * 100)}% confidence
+                        </span>
+                      </small>
+                      {item.detail && <small className="mx-review-twin">{item.detail}</small>}
+                    </span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+
+            <div className="mx-voice-btn-row">
+              <button
+                type="button"
+                className="primary sm"
+                disabled={parsedItems.every((i) => !i.kept)}
+                onClick={handleCommitParsedItems}
+              >
+                Add selected to my twin
+              </button>
+              <button
+                type="button"
+                className="secondary sm"
+                onClick={() => {
+                  setParsedItems([]);
+                  setParsedSummary(null);
+                }}
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* REPORT BRIEFING CARD */}
       {(briefingLoading || briefing || briefingError) && (
-        <section
-          className="card mx-briefing-card"
-          aria-label="Your report briefing"
-        >
+        <section className="card mx-briefing-card" aria-label="Your report briefing">
           <div className="sec">
             <div>
-              <span className="mx-eyebrow">Report briefing</span>
+              <span className="mx-eyebrow">Longitudinal Report Briefing</span>
               <h2>What changed in your latest report</h2>
             </div>
             <span className="state warn">
               <i />
-              Waiting for check
+              Pending care-team check
             </span>
           </div>
 
           {briefingLoading ? (
-            <div className="mx-status-line" role="status">
-              <span className="ap-dots" aria-hidden="true">
-                <i />
-                <i />
-                <i />
-              </span>
-              <span>Preparing your plain-language briefing…</span>
-            </div>
+            <p className="note" role="status">
+              Preparing your plain-language longitudinal briefing…
+            </p>
           ) : briefingError && !briefing ? (
             <p className="note">
-              Your results were saved to “Added by you”, though the briefing service could not be reached right now.
+              Your results were appended to your Twin timeline; briefing synthesis was temporarily unavailable.
             </p>
           ) : briefing ? (
             <>
@@ -940,9 +1667,7 @@ export function FeedScreen({
                 <button
                   type="button"
                   className="link"
-                  onClick={() => {
-                    navigate('#/you/checkin:ask');
-                  }}
+                  onClick={() => navigate('#/you/checkin:ask')}
                 >
                   Ask your twin about these changes →
                 </button>
@@ -952,6 +1677,7 @@ export function FeedScreen({
         </section>
       )}
 
+      {/* TWIN OPEN QUESTIONS */}
       {patientAsks.length > 0 && AskQuestions && (
         <section className="card feed-asks">
           <div className="sec">
@@ -961,95 +1687,142 @@ export function FeedScreen({
         </section>
       )}
 
-      <h2 className="feed-h">Add something new</h2>
-      <div className="feed-kinds">
-        {FEED_KINDS.map(([kindId, title, subtitle, iconName]) => (
-          <button
-            key={kindId}
-            className="card feed-kind"
-            onClick={() => setActiveKind(kindId)}
-          >
-            <span className="tb-ic" aria-hidden={true}>
-              {Icon ? <Icon name={iconName} size={22} /> : null}
-            </span>
-            <span>
-              <b>{title}</b>
-              <small>{subtitle}</small>
-            </span>
-            <span className="feed-plus" aria-hidden={true}>
-              +
-            </span>
-          </button>
-        ))}
+      {/* 8 COMPREHENSIVE PERSONAL DATA CATEGORIES */}
+      <h2 className="feed-h">Contribute by category (8 domains)</h2>
+      <div className="feed-kinds mx-feed-8grid" data-testid="feed-categories-grid">
+        {FEED_CATEGORIES.map((cat) => {
+          const count = entries.filter((e) => inferCategoryFromEntry(e) === cat.id).length;
+          return (
+            <button
+              key={cat.id}
+              type="button"
+              className="card feed-kind"
+              onClick={() => setActiveCategory(cat.id)}
+            >
+              <span className="tb-ic" aria-hidden={true}>
+                {Icon ? <Icon name={cat.icon} size={22} /> : null}
+              </span>
+              <span>
+                <b>
+                  {cat.title}
+                  {count > 0 ? ` (${count})` : ''}
+                </b>
+                <small>{cat.subtitle}</small>
+              </span>
+              <span className="feed-plus" aria-hidden={true}>
+                +
+              </span>
+            </button>
+          );
+        })}
       </div>
 
+      {/* LONGITUDINAL PROVENANCE TIMELINE */}
       <section className="card feed-list">
         <div className="sec">
-          <h2>Added by you</h2>
-          <span className="note">
-            {entries.length
-              ? `${entries.length} waiting for your care team`
-              : 'Nothing yet'}
+          <div>
+            <h2>Longitudinal contributions to your twin</h2>
+            <p className="note">
+              Every record preserves its timestamp, source provenance, and verification state — prior records are never overwritten.
+            </p>
+          </div>
+          <span className="note mx-tabular">
+            {entries.length ? `${entries.length} recorded` : 'Nothing yet'}
           </span>
         </div>
-        {!entries.length && (
+
+        {entries.length > 0 && (
+          <div className="mx-kg-filters" role="tablist" aria-label="Filter contributions by category">
+            <button
+              type="button"
+              className={`mx-kg-chip${timelineFilter === 'all' ? ' is-active' : ''}`}
+              onClick={() => setTimelineFilter('all')}
+            >
+              All ({entries.length})
+            </button>
+            {FEED_CATEGORIES.map((cat) => {
+              const cnt = entries.filter((e) => inferCategoryFromEntry(e) === cat.id).length;
+              if (!cnt) return null;
+              return (
+                <button
+                  key={cat.id}
+                  type="button"
+                  className={`mx-kg-chip${timelineFilter === cat.id ? ' is-active' : ''}`}
+                  onClick={() => setTimelineFilter(cat.id)}
+                >
+                  {cat.title} ({cnt})
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {!filteredEntries.length && (
           <p className="note">
-            What you add appears here, marked as waiting until your care team has checked it.
+            Contributions appear chronologically here with full provenance and care-team review tracking.
           </p>
         )}
+
         <ul className="rs-rows mx-added-rows">
-          {entries.map((entry) => (
-            <li key={entry.id}>
-              <span>
-                <b title={entry.title}>{entry.title}</b>
-                <small>
-                  {kindLabel(entry.kind)} · {host.formatDate(entry.date)}
-                  {entry.detail ? ` · ${entry.detail}` : ''}
-                </small>
-              </span>
-              <span className="state warn">
-                <i />
-                Waiting for check
-              </span>
-              <button
-                className="link"
-                onClick={() => handleRemove(entry.id)}
-                aria-label={`Remove ${entry.title}`}
-              >
-                Remove
-              </button>
-            </li>
-          ))}
+          {filteredEntries.map((entry) => {
+            const cat = inferCategoryFromEntry(entry);
+            const prov = entry.provenance ? PROVENANCE_LABELS[entry.provenance] : 'User reported';
+            const isPersonalContext =
+              entry.reviewStatus === 'personal_context' ||
+              cat === 'personal_diary' ||
+              cat === 'daily_activities' ||
+              cat === 'voice_conversations';
+
+            return (
+              <li key={entry.id}>
+                <span>
+                  <b title={entry.title}>{entry.title}</b>
+                  <small>
+                    {categoryTitle(cat)} · {host.formatDate(entry.date)} · {prov}
+                    {entry.confidence != null
+                      ? ` · ${Math.round(entry.confidence * 100)}% conf.`
+                      : ''}
+                    {entry.detail ? ` — ${entry.detail}` : ''}
+                  </small>
+                </span>
+                <span className={`state ${isPersonalContext ? 'ok' : 'warn'}`}>
+                  <i />
+                  {isPersonalContext ? 'Saved to Twin' : 'Waiting for check'}
+                </span>
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => handleRemove(entry.id)}
+                  aria-label={`Remove ${entry.title}`}
+                >
+                  Remove
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </section>
 
       {InfoBanner && (
         <InfoBanner
-          text="Your twin never changes from an entry until your care team has checked it"
+          text="Clinical results, medicines, and measurements are reviewed by your care team before modifying medical rules; personal diary and daily notes enrich your Twin immediately."
           tone="info"
         />
       )}
 
-      {activeKind && Sheet && (
+      {activeCategory && Sheet && (
         <Sheet
-          onClose={() => setActiveKind(null)}
-          label={kindLabel(activeKind)}
+          onClose={() => setActiveCategory(null)}
+          label={categoryTitle(activeCategory)}
         >
-          <h2>{kindLabel(activeKind)}</h2>
-          {activeKind === 'report' ? (
-            <ReportScanForm
-              bundle={b}
-              defaultDate={todayIso()}
-              apiBase={host.apiBase}
-              onAddKeptRows={handleAddReportRows}
-            />
-          ) : (
-            <StandardFeedForm
-              kind={activeKind}
-              bundle={b}
-              onSave={handleSaveSingle}
-            />
-          )}
+          <h2>{categoryTitle(activeCategory)}</h2>
+          <CategoryEntryForm
+            category={activeCategory}
+            bundle={b}
+            host={host}
+            onSave={handleSaveSingle}
+            onAddReportRows={handleAddReportRows}
+          />
         </Sheet>
       )}
     </>
